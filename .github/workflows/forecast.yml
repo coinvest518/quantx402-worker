@@ -10,7 +10,7 @@ permissions:
   contents: read
 jobs:
   run:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
@@ -23,8 +23,8 @@ jobs:
       TORCH_NUM_THREADS: "2"
       HF_HOME: ${{ github.workspace }}/.hf
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
@@ -34,7 +34,7 @@ jobs:
           pip install --index-url https://download.pytorch.org/whl/cpu torch==2.5.1
           pip install -r requirements.txt
       - name: Cache model weights
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .hf
           key: hf-kronos-small-v1
