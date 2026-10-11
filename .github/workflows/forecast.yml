@@ -1,0 +1,46 @@
+name: forecast
+on:
+  schedule:
+    - cron: "3 * * * *"        # minute 3 every hour (UTC). GitHub may start late; the worker always uses the latest closed candle.
+  workflow_dispatch: {}
+concurrency:
+  group: forecast
+  cancel-in-progress: false
+permissions:
+  contents: read
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      SYMBOLS: BTC-USD,ETH-USD
+      LOOKBACK: "360"
+      HORIZON: "24"
+      PATHS: "30"
+      TEMP: "1.0"
+      TOP_P: "0.9"
+      TORCH_NUM_THREADS: "2"
+      HF_HOME: ${{ github.workspace }}/.hf
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install (CPU torch)
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch==2.5.1
+          pip install -r requirements.txt
+      - name: Cache model weights
+        uses: actions/cache@v4
+        with:
+          path: .hf
+          key: hf-kronos-small-v1
+      - name: Warm weights
+        run: python -c "from model import Kronos, KronosTokenizer; KronosTokenizer.from_pretrained('NeoQuasar/Kronos-Tokenizer-base'); Kronos.from_pretrained('NeoQuasar/Kronos-small')"
+      - name: Forecast, score outcomes, record run
+        env:
+          HF_HUB_OFFLINE: "1"
+        run: python worker.py
