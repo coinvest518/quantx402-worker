@@ -44,3 +44,10 @@ jobs:
         env:
           HF_HUB_OFFLINE: "1"
         run: python worker.py
+      - name: Polymarket markets (public Gamma API; never fails the job)
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 3
+        env:
+          PM_BUDGET_SEC: "50"
+        run: python polymarket.py

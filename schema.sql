@@ -80,3 +80,39 @@ create table if not exists worker_runs (
   error         text
 );
 create index if not exists worker_runs_started_idx on worker_runs (started_at desc);
+
+-- v6: Polymarket public market data (Gamma API, no key). Additive only.
+create table if not exists prediction_markets (
+  source        text        not null default 'polymarket',
+  market_id     text        not null,                 -- Gamma market id
+  slug          text        not null,
+  event_slug    text,
+  question      text        not null,
+  category      text        not null,                 -- crypto_price | crypto_touch | macro
+  asset_symbol  text,                                 -- BTC | ETH | SOL | null (macro)
+  strike        double precision,                     -- price level parsed from the market, if any
+  comparator    text,                                 -- above | below | touch_above | touch_below | null
+  resolve_time  timestamptz,
+  resolution_source text,                             -- e.g. Binance BTC/USDT 1m close at 12:00 ET
+  url           text        not null,
+  yes_price     double precision,                     -- latest Yes price (0..1) from Gamma outcomePrices
+  volume        double precision,
+  liquidity     double precision,
+  active        boolean     not null default true,
+  updated_at    timestamptz not null default now(),
+  primary key (source, market_id)
+);
+create index if not exists prediction_markets_asset_idx on prediction_markets (asset_symbol, resolve_time);
+create index if not exists prediction_markets_cat_idx on prediction_markets (category, resolve_time);
+
+create table if not exists pm_snapshots (
+  source     text        not null default 'polymarket',
+  market_id  text        not null,
+  ts         timestamptz not null,                    -- ingestion hour (UTC, floored)
+  yes_price  double precision,
+  no_price   double precision,
+  volume     double precision,
+  liquidity  double precision,
+  primary key (source, market_id, ts)
+);
+create index if not exists pm_snapshots_market_ts_idx on pm_snapshots (market_id, ts);
