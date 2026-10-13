@@ -1,0 +1,29 @@
+name: stock-bars
+on:
+  schedule:
+    - cron: "40 13-21 * * 1-5"   # hourly during US market hours (09:40-17:40 ET in EDT; 08:40-16:40 ET in EST)
+    - cron: "30 22 * * 1-5"      # once after the close (18:30 EDT / 17:30 EST) for the final daily bar
+  workflow_dispatch: {}
+concurrency:
+  group: stock-bars
+  cancel-in-progress: false
+permissions:
+  contents: read
+jobs:
+  run:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      ALPACA_API_KEY_ID: ${{ secrets.ALPACA_API_KEY_ID }}
+      ALPACA_API_SECRET_KEY: ${{ secrets.ALPACA_API_SECRET_KEY }}
+      STOCK_SYMBOLS: SPY,QQQ
+      STOCK_FEED: sip
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip install "psycopg[binary]>=3.2"
+      - name: Alpaca bars -> stock_bars (stored only, never served)
+        run: python alpaca_bars.py

@@ -116,3 +116,11 @@ create table if not exists pm_snapshots (
   primary key (source, market_id, ts)
 );
 create index if not exists pm_snapshots_market_ts_idx on pm_snapshots (market_id, ts);
+
+-- v7: US stock/ETF bars from Alpaca market data (SIP, adjustment=all). Stored for model input only; not served. Additive only.
+create table if not exists stock_bars (
+  symbol text not null, timeframe text not null, ts timestamptz not null,
+  o double precision not null, h double precision not null, l double precision not null, c double precision not null,
+  v double precision not null, vwap double precision, trade_count bigint,
+  source text not null default 'alpaca_sip', fetched_at timestamptz not null default now(),
+  primary key (symbol, timeframe, ts));
