@@ -11,6 +11,10 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4]
     timeout-minutes: 14
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
@@ -20,6 +24,8 @@ jobs:
       TEMP: "1.0"
       TOP_P: "0.9"
       TORCH_NUM_THREADS: "4"
+      SHARD: ${{ matrix.shard }}
+      SHARDS: "5"
       HF_HOME: ${{ github.workspace }}/.hf
       TIMEFRAMES: "15m"
     steps:

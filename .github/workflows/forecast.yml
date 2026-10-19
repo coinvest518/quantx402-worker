@@ -11,6 +11,10 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4]
     timeout-minutes: 25
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
@@ -20,6 +24,8 @@ jobs:
       TEMP: "1.0"
       TOP_P: "0.9"
       TORCH_NUM_THREADS: "4"
+      SHARD: ${{ matrix.shard }}
+      SHARDS: "5"
       HF_HOME: ${{ github.workspace }}/.hf
       TIMEFRAMES: "1h"
     steps:
@@ -44,8 +50,8 @@ jobs:
         env:
           HF_HUB_OFFLINE: "1"
         run: python worker.py
-      - name: Polymarket markets (public Gamma API; never fails the job)
-        if: always()
+      - name: Prediction-market snapshot (never fails the job)
+        if: always() && matrix.shard == 0
         continue-on-error: true
         timeout-minutes: 3
         env:
