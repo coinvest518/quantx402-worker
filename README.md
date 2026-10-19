@@ -1,13 +1,24 @@
 # quantx402-worker
 
-Hourly forecasting job for [QuantX402](https://quantx402.app), powered by Kronos.
+Forecasting jobs for [QuantX402](https://quantx402.app), powered by Kronos. Everything runs on GitHub Actions; there is no server.
 
-Every hour (GitHub Actions, `3 * * * *` UTC) it:
-1. fetches the last 360 closed 1h candles for BTC-USD and ETH-USD (Coinbase public API, Binance public mirror as fallback),
-2. runs Kronos-small (T=1.0, top_p=0.9, 30 sampled paths, 24 bars ahead),
-3. writes the fact list, per-step percentiles and paths to Postgres (`DATABASE_URL` repo secret),
-4. scores past forecasts whose horizon has closed (`outcomes`), and records the run in `worker_runs`,
-5. pulls public Polymarket market data (Gamma API, no key) for BTC/ETH/SOL price-level markets plus Fed-decision and US CPI markets into `prediction_markets` and hourly `pm_snapshots` (`polymarket.py`; capped at ~50 s and never fails the job).
+| Workflow | Schedule (UTC) | What |
+|---|---|---|
+| `forecast-15m.yml` | `1,16,31,46 * * * *` | 15m forecasts (16 bars ahead) |
+| `forecast.yml` | `3 * * * *` | 1h forecasts (24 bars ahead) + prediction-market snapshot |
+| `forecast-4h.yml` | `20 */4 * * *` | 4h forecasts (18 bars ahead; 4h bars are built from closed 1h bars) |
+| `forecast-1d.yml` | `5 0 * * *` | 1d forecasts (7 bars ahead) |
+| `news.yml` | every 20 min | headlines -> `news_items` (symbols, tone score, dedupe key; no source fields stored) |
+| `ondemand.yml` | dispatched by the site | one paid on-demand forecast (`forecast_jobs` row) |
+
+Each forecast run: fetches the last 360 closed candles from public exchange feeds (with a backup feed), runs Kronos-small
+(T=1.0, top_p=0.9, 30 paths), writes the fact list, percentiles and paths to Postgres (`DATABASE_URL` secret), scores past
+forecasts whose horizon has closed (`outcomes`), and records the run in `worker_runs`.
+
+Symbols: `SYMBOLS` (default 10 crypto pairs) plus up to `AUTO_PROMOTE_MAX` pairs auto-promoted from on-demand demand
+(>=5 requests from >=2 callers in 7 days, `tracked_symbols`). On-demand stock jobs read our own `stock_bars` table.
+
+Stored and served labels are generic: no upstream feed or publisher names are written to public fields.
 
 Re-runs are idempotent (`unique(symbol, timeframe, model, as_of)`).
 

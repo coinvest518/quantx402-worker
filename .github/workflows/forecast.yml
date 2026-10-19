@@ -1,7 +1,7 @@
 name: forecast
 on:
   schedule:
-    - cron: "3 * * * *"        # minute 3 every hour (UTC). GitHub may start late; the worker always uses the latest closed candle.
+    - cron: "3 * * * *"   # 1h: minute 3 every hour UTC (the site cron backs this up at :05)
   workflow_dispatch: {}
 concurrency:
   group: forecast
@@ -11,17 +11,17 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 25
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
-      SYMBOLS: BTC-USD,ETH-USD
+      SYMBOLS: BTC-USD,ETH-USD,SOL-USD,XRP-USD,BNB-USD,DOGE-USD,ADA-USD,AVAX-USD,LINK-USD,SUI-USD
       LOOKBACK: "360"
-      HORIZON: "24"
       PATHS: "30"
       TEMP: "1.0"
       TOP_P: "0.9"
-      TORCH_NUM_THREADS: "2"
+      TORCH_NUM_THREADS: "4"
       HF_HOME: ${{ github.workspace }}/.hf
+      TIMEFRAMES: "1h"
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -40,7 +40,7 @@ jobs:
           key: hf-kronos-small-v1
       - name: Warm weights
         run: python -c "from model import Kronos, KronosTokenizer; KronosTokenizer.from_pretrained('NeoQuasar/Kronos-Tokenizer-base'); Kronos.from_pretrained('NeoQuasar/Kronos-small')"
-      - name: Forecast, score outcomes, record run
+      - name: Forecast 1h, score outcomes, record run
         env:
           HF_HUB_OFFLINE: "1"
         run: python worker.py
