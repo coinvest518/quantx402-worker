@@ -28,7 +28,7 @@ Forecasts are probabilistic model output for research and education. Not financi
 
 ## Research brief rationale (`brief_rationale.py`, `brief.yml`)
 Hourly at :20 (dispatched by the site after it warms briefs at :15; GitHub schedule at :25 as backup). A small open-weights
-instruct model (3B, 4-bit, CPU via llama.cpp, weights cached between runs) writes strict-JSON prose for the newest brief
+instruct model (3B, 4-bit, on CPU, weights cached between runs) writes strict-JSON prose for the newest brief
 per symbol. It never writes digits: it uses placeholders that code fills with computed values, then the same guardrails as
 the site run (length, banned phrases, brand names, number check, direction, tone, conflict, exact-quote headlines). Passing
 text goes to `brief_rationales`; the site re-checks it against current numbers before serving, else uses the template.
