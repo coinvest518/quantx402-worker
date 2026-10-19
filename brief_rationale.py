@@ -54,6 +54,9 @@ def check(text, inp):
     d = inp["forecast"]["direction"]
     up, dn = re.search(r"\b(up|upward|higher)\b", s, re.I), re.search(r"\b(down|downward|lower)\b", s, re.I)
     neu = re.search(r"\b(leans? neutral|neutral lean|lean is neutral|no clear (lean|direction)|no lean)\b", s, re.I)
+    bw = {"none": "no", "low": "low", "med": "med(ium)?"}; bk = inp["forecast"]["confidence_bucket"]
+    if not re.search(r"\b" + bw[bk] + r" confidence\b", s, re.I): return "confidence_mismatch"
+    if any(k != bk and re.search(r"\b" + w + r" confidence\b", s, re.I) for k, w in bw.items()): return "confidence_mismatch"
     n = inp.get("news"); lbl = n["tone_label"].replace("_", " ") if n else None
     if lbl and not re.search(r"\b" + lbl + r"\b", s, re.I): return "news_tone_mismatch"
     if not lbl and re.search(r"\btone\b[^.]{0,40}\b(positive|negative|neutral)\b", s, re.I): return "news_tone_mismatch"
