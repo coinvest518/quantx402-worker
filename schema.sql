@@ -122,5 +122,5 @@ create table if not exists stock_bars (
   symbol text not null, timeframe text not null, ts timestamptz not null,
   o double precision not null, h double precision not null, l double precision not null, c double precision not null,
   v double precision not null, vwap double precision, trade_count bigint,
-  source text not null default 'alpaca_sip', fetched_at timestamptz not null default now(),
+  source text not null default 'market_feed', fetched_at timestamptz not null default now(),
   primary key (symbol, timeframe, ts));

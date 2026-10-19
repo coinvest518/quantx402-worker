@@ -8,7 +8,8 @@ from datetime import datetime, timedelta, timezone
 E = os.environ.get
 SYMBOLS = [s.strip().upper() for s in E("STOCK_SYMBOLS", "SPY,QQQ").split(",") if s.strip()]
 FEED = E("STOCK_FEED", "sip")
-TFS = [("1d", "1Day", "2016-01-04T00:00:00Z"), ("1h", "1Hour", "2017-01-03T00:00:00Z")]
+TFS = [("1d", "1Day", "2016-01-04T00:00:00Z"), ("1h", "1Hour", "2017-01-03T00:00:00Z"), ("15m", "15Min", "2024-01-02T00:00:00Z")]
+SRC = "market_feed"  # generic; never store provider names
 BASE = "https://data.alpaca.markets/v2/stocks/bars"
 HDR = {"APCA-API-KEY-ID": (E("ALPACA_API_KEY_ID") or "").strip(), "APCA-API-SECRET-KEY": (E("ALPACA_API_SECRET_KEY") or "").strip(), "Accept": "application/json"}
 
@@ -16,7 +17,7 @@ DDL = """create table if not exists stock_bars (
   symbol text not null, timeframe text not null, ts timestamptz not null,
   o double precision not null, h double precision not null, l double precision not null, c double precision not null,
   v double precision not null, vwap double precision, trade_count bigint,
-  source text not null default 'alpaca_sip', fetched_at timestamptz not null default now(),
+  source text not null default 'market_feed', fetched_at timestamptz not null default now(),
   primary key (symbol, timeframe, ts))"""
 UPSERT = """insert into stock_bars (symbol, timeframe, ts, o, h, l, c, v, vwap, trade_count, source)
   values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
@@ -42,9 +43,11 @@ def main():
     import psycopg
     con = psycopg.connect(E("DATABASE_URL"), autocommit=True)
     con.execute(DDL)
+    con.execute("alter table stock_bars alter column source set default 'market_feed'")
+    con.execute("update stock_bars set source=%s where source <> %s", (SRC, SRC))
     # Basic plan: SIP is available except the most recent 15 minutes.
     end = (datetime.now(timezone.utc) - timedelta(minutes=16)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    src = "alpaca_" + FEED
+    src = SRC
     for tf, atf, first in TFS:
         for sym in SYMBOLS:
             last = con.execute("select max(ts) from stock_bars where symbol=%s and timeframe=%s", (sym, tf)).fetchone()[0]
@@ -52,7 +55,14 @@ def main():
             params = {"symbols": sym, "timeframe": atf, "start": start, "end": end, "limit": 10000, "adjustment": "all", "feed": FEED, "sort": "asc"}
             n = pages = 0
             while True:
-                d = get(params); pages += 1
+                try:
+                    d = get(params)
+                except RuntimeError as e:
+                    # recent premium-feed window can be restricted; fall back to the free feed for it
+                    if params.get("feed") != "iex" and (" 403" in str(e) or " 422" in str(e)):
+                        print(f"{sym} {tf}: feed restricted, falling back for this window"); params["feed"] = "iex"; params.pop("page_token", None); continue
+                    raise
+                pages += 1
                 rows = [(sym, tf, b["t"], b["o"], b["h"], b["l"], b["c"], b["v"], b.get("vw"), b.get("n"), src) for b in (d.get("bars") or {}).get(sym, [])]
                 if rows:
                     with con.cursor() as cur: cur.executemany(UPSERT, rows)
