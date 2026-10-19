@@ -1,0 +1,49 @@
+name: ondemand
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: forecast_jobs id (odj_...)
+        required: true
+        type: string
+concurrency:
+  group: ondemand-${{ inputs.job_id }}
+  cancel-in-progress: false
+permissions:
+  contents: read
+jobs:
+  run:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      SYMBOLS: BTC-USD,ETH-USD,SOL-USD,XRP-USD,BNB-USD,DOGE-USD,ADA-USD,AVAX-USD,LINK-USD,SUI-USD
+      LOOKBACK: "360"
+      PATHS: "30"
+      TEMP: "1.0"
+      TOP_P: "0.9"
+      TORCH_NUM_THREADS: "4"
+      HF_HOME: ${{ github.workspace }}/.hf
+      JOB_ID: ${{ inputs.job_id }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install (CPU torch)
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch==2.5.1
+          pip install -r requirements.txt
+      - name: Cache model weights
+        uses: actions/cache@v6
+        with:
+          path: .hf
+          key: hf-kronos-small-v1
+      - name: Warm weights
+        run: python -c "from model import Kronos, KronosTokenizer; KronosTokenizer.from_pretrained('NeoQuasar/Kronos-Tokenizer-base'); Kronos.from_pretrained('NeoQuasar/Kronos-small')"
+      - name: Run the on-demand job
+        env:
+          HF_HUB_OFFLINE: "1"
+        run: python ondemand.py
