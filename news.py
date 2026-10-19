@@ -36,7 +36,34 @@ FEEDS = [
     (gnews("Nvidia OR Tesla OR Apple stock"), [], True),
     (gnews("Microsoft OR Amazon OR Alphabet OR Meta stock"), [], True),
     (gnews("Dow Jones OR Russell 2000"), [], True),
+    # more public crypto / finance outlets (headlines naming the outlet are still dropped)
+    ("https://www.coindesk.com/arc/outboundfeeds/rss/", [], False),
+    ("https://bitcoinmagazine.com/.rss/full/", ["BTC"], False),
+    ("https://cryptoslate.com/feed/", [], False),
+    ("https://www.theblock.co/rss.xml", [], False),
+    ("https://feeds.content.dowjones.io/public/rss/mw_topstories", [], False),
+    ("https://www.investing.com/rss/news_25.rss", [], False),
+    ("https://seekingalpha.com/market_currents.xml", [], False),
 ]
+# Public economic-data releases (official statistics / central bank). Tagged MACRO plus broad-market ETFs.
+MACRO_FEEDS = [
+    "https://www.federalreserve.gov/feeds/press_all.xml",
+    "https://www.bls.gov/feed/bls_latest.rss",
+    "https://apps.bea.gov/rss/rss.xml",
+]
+MACRO_SYMS = ["MACRO", "SPY", "QQQ", "DIA", "IWM"]
+# Public company filings (current-report atom feed per ticker). Turned into our own neutral headline.
+FILING_TICKERS = {"AAPL": "Apple", "NVDA": "Nvidia", "TSLA": "Tesla", "MSFT": "Microsoft", "AMZN": "Amazon", "META": "Meta Platforms", "GOOGL": "Alphabet"}
+FILING_FORMS = {"8-K": "current report", "10-Q": "quarterly report", "10-K": "annual report", "4": "insider transaction report", "144": "notice of proposed insider share sale", "S-1": "registration statement"}
+FILINGS_UA = E("FILINGS_USER_AGENT", "QuantX402 research ops@quantx402.app")  # the filings site asks for a contact UA
+def filings_url(t): return "https://www.sec.gov/cgi-bin/browse-edgar?" + requests.compat.urlencode({"action": "getcompany", "CIK": t, "type": "", "dateb": "", "owner": "include", "count": "10", "output": "atom"})
+# Social trends: tiny recent-search sample per run (free public read tier, shared 1000 reads/day cap across all users).
+X_TOKEN = E("X_BEARER_TOKEN", "")
+X_EVERY_H = int(E("X_EVERY_H", "2"))            # run the social step on even UTC hours only -> 12 runs/day
+X_MAX = int(E("X_MAX_RESULTS", "10"))            # 10 posts x 3 queries x 12 runs = 360 reads/day, well under 1000
+X_QUERIES = [("(bitcoin OR $BTC OR ethereum OR $ETH) lang:en -is:retweet -is:reply -has:links", ["BTC", "ETH"]),
+             ("($SOL OR $XRP OR $DOGE OR $ADA OR $AVAX OR $LINK OR $SUI OR $BNB) lang:en -is:retweet -is:reply -has:links", []),
+             ("($SPY OR $QQQ OR $NVDA OR $TSLA OR $AAPL) lang:en -is:retweet -is:reply -has:links", [])]
 
 I = re.I
 TAGS = {
@@ -119,22 +146,69 @@ def collect(now=None, fetch=None):
                 key = hashlib.sha256(re.sub(r"[^a-z0-9]", "", h.lower()).encode()).hexdigest()[:32]
                 if key in seen: continue
                 seen.add(key)
-                out.append({"published_at": d.astimezone(timezone.utc).isoformat(), "symbols": syms, "headline": h, "score": round(tone(h), 3), "dedupe_key": key})
+                out.append({"published_at": d.astimezone(timezone.utc).isoformat(), "symbols": syms, "headline": h, "score": round(tone(h), 3), "dedupe_key": key, "kind": "news"})
         except Exception as e:
             stats["feeds_failed"] += 1; print(f"feed #{i} failed: {type(e).__name__}", file=sys.stderr)
     return out, stats
+
+def _row(h, d, syms, now, kind, seen):
+    if not h or len(h) < 20 or len(h) > 300 or not d or now - d > MAX_AGE or d > now + timedelta(minutes=10): return None
+    if BRANDS.search(h): return None
+    key = hashlib.sha256((kind + ":" + re.sub(r"[^a-z0-9]", "", h.lower())).encode()).hexdigest()[:32]
+    if key in seen: return None
+    seen.add(key)
+    return {"published_at": d.astimezone(timezone.utc).isoformat(), "symbols": sorted(set(syms)), "headline": h, "score": round(tone(h), 3), "dedupe_key": key, "kind": kind}
+
+def collect_extra(now=None, fetch=None, x_fetch=None):
+    """Economic releases, company filings and (optionally) a small social sample. Same storage rules as headlines."""
+    now = now or datetime.now(timezone.utc); seen, out, st = set(), [], {"macro": 0, "filings": 0, "social": 0, "extra_failed": 0}
+    fetch = fetch or (lambda u, ua=UA: requests.get(u, headers={"User-Agent": ua}, timeout=15))
+    for i, url in enumerate(MACRO_FEEDS):
+        try:
+            r = fetch(url); r.raise_for_status()
+            for title, date in items(r.content):
+                row = _row(clean(title, False), parse_date(date), MACRO_SYMS, now, "macro", seen)
+                if row: out.append(row); st["macro"] += 1
+        except Exception as e: st["extra_failed"] += 1; print(f"macro feed #{i} failed: {type(e).__name__}", file=sys.stderr)
+    for t, name in FILING_TICKERS.items():
+        try:
+            r = fetch(filings_url(t), FILINGS_UA); r.raise_for_status()
+            root = ET.fromstring(r.content)
+            for ent in [e for e in root.iter() if e.tag.split("}")[-1] == "entry"][:5]:
+                g = lambda n: next((c for c in ent.iter() if c.tag.split("}")[-1] == n), None)
+                form = (g("category").get("term") if g("category") is not None else "") or ""
+                if form not in FILING_FORMS: continue
+                d = parse_date(g("updated").text if g("updated") is not None else None)
+                row = _row(f"{name} files {form} {FILING_FORMS[form]} with US regulator", d, [t], now, "filing", seen)
+                if row: row["score"] = 0.0; out.append(row); st["filings"] += 1
+            time.sleep(0.15)   # stay far below the filings site's 10 requests/second guidance
+        except Exception as e: st["extra_failed"] += 1; print(f"filings {t} failed: {type(e).__name__}", file=sys.stderr)
+    if X_TOKEN and now.hour % X_EVERY_H == 0 and now.minute < 20:
+        xf = x_fetch or (lambda q: requests.get("https://api.x.com/2/tweets/search/recent", params={"query": q, "max_results": X_MAX, "tweet.fields": "created_at"}, headers={"Authorization": f"Bearer {X_TOKEN}"}, timeout=15))
+        for q, default in X_QUERIES:
+            try:
+                r = xf(q); r.raise_for_status()
+                for p in (r.json().get("data") or [])[:X_MAX]:
+                    txt = re.sub(r"@\w+|https?://\S+|#", "", html.unescape(p.get("text", ""))); txt = re.sub(r"\s+", " ", txt).strip()[:280]
+                    syms = set(default) | {k for k, rx in TAGS.items() if rx.search(txt)} | {m.upper() for m in re.findall(r"\$([A-Za-z]{2,5})\b", p.get("text", "")) if m.upper() in TAGS}
+                    if not syms: continue
+                    row = _row(txt, parse_date(p.get("created_at")), syms, now, "social", seen)
+                    if row: out.append(row); st["social"] += 1
+            except Exception as e: st["extra_failed"] += 1; print(f"social query failed: {type(e).__name__}", file=sys.stderr)
+    return out, st
 
 def store(c, rows):
     """One batched insert; duplicates (dedupe_key) are skipped. Then 30-day retention on our own table."""
     n = c.execute("""insert into news_items (published_at, symbols, headline, summary, score, dedupe_key)
         select published_at, symbols, headline, null, score, dedupe_key from jsonb_to_recordset(%s::jsonb)
-          as r(published_at timestamptz, symbols text[], headline text, score double precision, dedupe_key text)
+          as r(published_at timestamptz, symbols text[], headline text, score double precision, dedupe_key text, kind text)
         on conflict (dedupe_key) do nothing returning 1""", (json.dumps(rows),)).fetchall()
     c.execute("delete from news_items where published_at < now() - interval '30 days'")
     return len(n)
 
 def main():
     rows, stats = collect()
+    extra, xs = collect_extra(); rows += extra; stats.update(xs)
     if DRY:
         print(json.dumps({"stats": stats, "count": len(rows), "rows": rows[:10]}, indent=1)); return 0
     import psycopg

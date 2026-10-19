@@ -1,0 +1,36 @@
+name: brief
+on:
+  schedule:
+    - cron: "25 * * * *"   # backup; the site's scheduler dispatches at :20 after warming briefs at :15
+  workflow_dispatch: {}
+concurrency:
+  group: brief
+  cancel-in-progress: false
+permissions:
+  contents: read
+jobs:
+  run:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      RATIONALE_MODEL_PATH: model/rationale.gguf
+      RATIONALE_MAX_BRIEFS: "12"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Cache model weights
+        uses: actions/cache@v4
+        with:
+          path: model/rationale.gguf
+          key: rationale-open-instruct-3b-q4km-v1
+      - name: Install
+        run: pip install "psycopg[binary]" llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+      - name: Fetch open-weights model (once; cached)
+        run: |
+          mkdir -p model
+          [ -f model/rationale.gguf ] || curl -sSfL -o model/rationale.gguf "https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q4_k_m.gguf"
+      - name: Write rationales (never fails the job; site falls back to the template)
+        run: python brief_rationale.py || true
