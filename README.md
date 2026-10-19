@@ -25,3 +25,15 @@ Re-runs are idempotent (`unique(symbol, timeframe, model, as_of)`).
 `model/` is the Kronos model code from [shiyu-coder/Kronos](https://github.com/shiyu-coder/Kronos) (MIT). This project is not affiliated with the Kronos authors.
 
 Forecasts are probabilistic model output for research and education. Not financial advice.
+
+## Research brief rationale (`brief_rationale.py`, `brief.yml`)
+Hourly at :20 (dispatched by the site after it warms briefs at :15; GitHub schedule at :25 as backup). A small open-weights
+instruct model (3B, 4-bit, on CPU, weights cached between runs) writes strict-JSON prose for the newest brief
+per symbol. It never writes digits: it uses placeholders that code fills with computed values, then the same guardrails as
+the site run (length, banned phrases, brand names, number check, direction, tone, conflict, exact-quote headlines). Passing
+text goes to `brief_rationales`; the site re-checks it against current numbers before serving, else uses the template.
+
+## News collector additions
+More public crypto/finance RSS feeds; official economic-data release feeds (tagged MACRO + broad ETFs); public company
+filings (per-ticker current-report feed, turned into our own neutral headline); optional social sample (`X_BEARER_TOKEN`,
+3 queries x 10 posts on even UTC hours = ~360 reads/day, under the shared 1,000/day cap). Source names stay internal.
