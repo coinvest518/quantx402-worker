@@ -35,5 +35,5 @@ text goes to `brief_rationales`; the site re-checks it against current numbers b
 
 ## News collector additions
 More public crypto/finance RSS feeds; official economic-data release feeds (tagged MACRO + broad ETFs); public company
-filings (per-ticker current-report feed, turned into our own neutral headline); optional social sample (`X_BEARER_TOKEN`,
-3 queries x 10 posts on even UTC hours = ~360 reads/day, under the shared 1,000/day cap). Source names stay internal.
+filings (per-ticker current-report feed, turned into our own neutral headline); optional social sample (hosted search, `APIFY_TOKEN`; 4 runs/day x 75 posts = 300/day, about $4.34/month, each run capped at $0.04 so at most $4.96/month; stored as kind=social, no handles/links/source names;
+spam and provider mentions dropped). Source names stay internal.
