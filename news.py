@@ -57,13 +57,19 @@ FILING_TICKERS = {"AAPL": "Apple", "NVDA": "Nvidia", "TSLA": "Tesla", "MSFT": "M
 FILING_FORMS = {"8-K": "current report", "10-Q": "quarterly report", "10-K": "annual report", "4": "insider transaction report", "144": "notice of proposed insider share sale", "S-1": "registration statement"}
 FILINGS_UA = E("FILINGS_USER_AGENT", "QuantX402 research ops@quantx402.app")  # the filings site asks for a contact UA
 def filings_url(t): return "https://www.sec.gov/cgi-bin/browse-edgar?" + requests.compat.urlencode({"action": "getcompany", "CIK": t, "type": "", "dateb": "", "owner": "include", "count": "10", "output": "atom"})
-# Social trends: tiny recent-search sample per run (free public read tier, shared 1000 reads/day cap across all users).
-X_TOKEN = E("X_BEARER_TOKEN", "")
-X_EVERY_H = int(E("X_EVERY_H", "2"))            # run the social step on even UTC hours only -> 12 runs/day
-X_MAX = int(E("X_MAX_RESULTS", "10"))            # 10 posts x 3 queries x 12 runs = 360 reads/day, well under 1000
-X_QUERIES = [("(bitcoin OR $BTC OR ethereum OR $ETH) lang:en -is:retweet -is:reply -has:links", ["BTC", "ETH"]),
-             ("($SOL OR $XRP OR $DOGE OR $ADA OR $AVAX OR $LINK OR $SUI OR $BNB) lang:en -is:retweet -is:reply -has:links", []),
-             ("($SPY OR $QQQ OR $NVDA OR $TSLA OR $AAPL) lang:en -is:retweet -is:reply -has:links", [])]
+# Social trends: small paid search sample via a hosted scraper (internal config; never stored or served).
+# Budget: SOCIAL_EVERY_H=6 -> 4 runs/day x 3 queries x 25 posts = 300 posts/day. Price: $0.005/run start + $0.0004/post
+# -> about $0.14/day, $4.34 per 31-day month. Each run is hard-capped at SOCIAL_MAX_USD_PER_RUN ($0.04) -> worst case $4.96/month.
+SOCIAL_TOKEN = E("APIFY_TOKEN", "")
+SOCIAL_ACTOR = "memo23~x-twitter-search-scraper"
+SOCIAL_EVERY_H = int(E("SOCIAL_EVERY_H", "6"))
+SOCIAL_PER_QUERY = int(E("SOCIAL_PER_QUERY", "25"))
+SOCIAL_MAX_USD_PER_RUN = float(E("SOCIAL_MAX_USD_PER_RUN", "0.04"))
+_Q = " lang:en -filter:replies -filter:retweets -filter:links min_faves:20"
+SOCIAL_QUERIES = ["(bitcoin OR ethereum OR $BTC OR $ETH)" + _Q,
+                  "($SOL OR $XRP OR $DOGE OR $ADA OR $AVAX OR $LINK OR $SUI OR $BNB)" + _Q,
+                  "($SPY OR $QQQ OR $NVDA OR $TSLA OR $AAPL OR $MSFT OR $AMZN OR $META OR $GOOGL)" + _Q]
+SPAM = re.compile(r"giveaway|airdrop|telegram|presale|pre-sale|drop your|follow (us|me)|retweet|\bRT\b|like \+|\bcalled\b|\b\d{2,}x\b|winner|join (the|my|us|now)|\bdm\b|link in bio|free \$|\bgem\b|100x|turned \$|would have turned|worth \$[\d,]+ now|signals? group|wallet gets|whitelist|\bwl\b|\bca:|up for grabs|prophetic|like and share|competition|\bnft\b|shocking|coincidence", re.I)
 
 I = re.I
 TAGS = {
@@ -159,7 +165,7 @@ def _row(h, d, syms, now, kind, seen):
     seen.add(key)
     return {"published_at": d.astimezone(timezone.utc).isoformat(), "symbols": sorted(set(syms)), "headline": h, "score": round(tone(h), 3), "dedupe_key": key, "kind": kind}
 
-def collect_extra(now=None, fetch=None, x_fetch=None):
+def collect_extra(now=None, fetch=None):
     """Economic releases, company filings and (optionally) a small social sample. Same storage rules as headlines."""
     now = now or datetime.now(timezone.utc); seen, out, st = set(), [], {"macro": 0, "filings": 0, "social": 0, "extra_failed": 0}
     fetch = fetch or (lambda u, ua=UA: requests.get(u, headers={"User-Agent": ua}, timeout=15))
@@ -183,24 +189,43 @@ def collect_extra(now=None, fetch=None, x_fetch=None):
                 if row: row["score"] = 0.0; out.append(row); st["filings"] += 1
             time.sleep(0.15)   # stay far below the filings site's 10 requests/second guidance
         except Exception as e: st["extra_failed"] += 1; print(f"filings {t} failed: {type(e).__name__}", file=sys.stderr)
-    if X_TOKEN and now.hour % X_EVERY_H == 0 and now.minute < 20:
-        xf = x_fetch or (lambda q: requests.get("https://api.x.com/2/tweets/search/recent", params={"query": q, "max_results": X_MAX, "tweet.fields": "created_at"}, headers={"Authorization": f"Bearer {X_TOKEN}"}, timeout=15))
-        for q, default in X_QUERIES:
-            try:
-                r = xf(q); r.raise_for_status()
-                for p in (r.json().get("data") or [])[:X_MAX]:
-                    txt = re.sub(r"@\w+|https?://\S+|#", "", html.unescape(p.get("text", ""))); txt = re.sub(r"\s+", " ", txt).strip()[:280]
-                    syms = set(default) | {k for k, rx in TAGS.items() if rx.search(txt)} | {m.upper() for m in re.findall(r"\$([A-Za-z]{2,5})\b", p.get("text", "")) if m.upper() in TAGS}
-                    if not syms: continue
-                    row = _row(txt, parse_date(p.get("created_at")), syms, now, "social", seen)
-                    if row: out.append(row); st["social"] += 1
-            except Exception as e: st["extra_failed"] += 1; print(f"social query failed: {type(e).__name__}", file=sys.stderr)
+    if SOCIAL_TOKEN and (now.hour % SOCIAL_EVERY_H == 0 and now.minute < 20 or E("SOCIAL_FORCE") == "1"):
+        try:
+            rows, sst = social_rows(fetch_social(), now, seen); out += rows; st.update(sst)
+        except Exception as e: st["extra_failed"] += 1; print(f"social step failed: {type(e).__name__}", file=sys.stderr)
     return out, st
+
+def social_rows(posts, now, seen):
+    """Hosted-scraper posts -> news_items rows labelled 'social'. Handles, links, hashtags and emoji stripped; spam and brand mentions dropped."""
+    out, st = [], {"social": 0, "social_dropped": 0}
+    for p in posts:
+        if p.get("isRetweet") or p.get("isReply") or (p.get("lang") and p.get("lang") != "en"): st["social_dropped"] += 1; continue
+        raw = html.unescape(p.get("text") or "")
+        if SPAM.search(raw) or BRANDS.search(raw): st["social_dropped"] += 1; continue
+        txt = re.sub(r"@\w+|https?://\S+|#", "", raw)
+        txt = re.sub(r"[^\x20-\x7E\u00C0-\u024F\u2018-\u201D]", " ", txt)
+        txt = re.sub(r"\s+", " ", txt).strip()[:280]
+        syms = {k for k, rx in TAGS.items() if rx.search(txt)} | {m.upper() for m in re.findall(r"\$([A-Za-z]{2,5})\b", raw) if m.upper() in TAGS}
+        if not syms: st["social_dropped"] += 1; continue
+        row = _row(txt, parse_date(p.get("createdAt")), syms, now, "social", seen)
+        if row: out.append(row); st["social"] += 1
+        else: st["social_dropped"] += 1
+    return out, st
+
+def fetch_social(fetch=None):
+    """One capped run of the hosted search scraper. Token sent as a header, never in the URL or logs."""
+    f = fetch or (lambda body: requests.post(f"https://api.apify.com/v2/acts/{SOCIAL_ACTOR}/run-sync-get-dataset-items",
+        params={"maxTotalChargeUsd": SOCIAL_MAX_USD_PER_RUN, "timeout": 180, "memory": 1024, "clean": "true"},
+        headers={"Authorization": f"Bearer {SOCIAL_TOKEN}"}, json=body, timeout=240))
+    r = f({"searchQueries": SOCIAL_QUERIES, "searchType": "Latest", "maxTweetsPerQuery": SOCIAL_PER_QUERY, "includeProfile": False, "includeAccountOrigin": False})
+    r.raise_for_status()
+    return [p for p in r.json() if isinstance(p, dict) and p.get("type", "tweet") == "tweet"]
 
 def store(c, rows):
     """One batched insert; duplicates (dedupe_key) are skipped. Then 30-day retention on our own table."""
-    n = c.execute("""insert into news_items (published_at, symbols, headline, summary, score, dedupe_key)
-        select published_at, symbols, headline, null, score, dedupe_key from jsonb_to_recordset(%s::jsonb)
+    c.execute("alter table news_items add column if not exists kind text not null default 'news'")  # additive; generic label only
+    n = c.execute("""insert into news_items (published_at, symbols, headline, summary, score, dedupe_key, kind)
+        select published_at, symbols, headline, null, score, dedupe_key, coalesce(kind, 'news') from jsonb_to_recordset(%s::jsonb)
           as r(published_at timestamptz, symbols text[], headline text, score double precision, dedupe_key text, kind text)
         on conflict (dedupe_key) do nothing returning 1""", (json.dumps(rows),)).fetchall()
     c.execute("delete from news_items where published_at < now() - interval '30 days'")
