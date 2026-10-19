@@ -279,7 +279,9 @@ def main():
     tfs = selected_timeframes()
     print("timeframes:", ",".join(tfs))
     syms = scheduled_symbols(c)
-    if c is not None and "1h" in tfs:
+    shard, shards = int(E("SHARD", "0")), max(1, int(E("SHARDS", "1")))
+    syms = syms[shard::shards]   # matrix jobs split symbols so each run fits its cadence; shard 0 also scores outcomes
+    if c is not None and "1h" in tfs and shard == 0:
         try: promote(c)
         except Exception as e: print("promote skipped:", type(e).__name__)
     for sym, tf in [(s, t) for t in tfs for s in syms]:
@@ -296,8 +298,9 @@ def main():
         except Exception as e:
             errors.append(f"{sym} {tf}: {type(e).__name__}"); print(f"{sym} {tf} failed: {type(e).__name__}", file=sys.stderr)
     if not DRY:
-        try: print("outcomes filled:", backfill(c))
-        except Exception as e: errors.append(f"backfill: {type(e).__name__}")
+        if shard == 0:
+          try: print("outcomes filled:", backfill(c))
+          except Exception as e: errors.append(f"backfill: {type(e).__name__}")
         try: c.execute("update forecasts set paths = '[]'::jsonb where as_of < now() - interval '90 days' and paths <> '[]'::jsonb")
         except Exception as e: errors.append(f"retention: {type(e).__name__}")
         c.execute("update worker_runs set finished_at = now(), ok = %s, symbols_done = %s, error = %s where id = %s",
