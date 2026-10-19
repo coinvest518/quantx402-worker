@@ -181,11 +181,16 @@ def build(symbol, feed, hist, paths, y_ts, runtime, tf="1h"):
                        "highs": [px(v) for v in paths[i, :, 1]]} for i in range(paths.shape[0])])
     return row
 
-def forecast(pred, symbol, tf="1h", conn=None):
+class AlreadyDone(Exception): pass
+
+def forecast(pred, symbol, tf="1h", conn=None, skip_existing=False):
     torch.manual_seed(SEED); np.random.seed(SEED)
     cfg = TF[tf]; h = cfg["horizon"]
     hist, feed = candles(symbol, CTX, tf, conn)
     if len(hist) < 50: raise RuntimeError(f"only {len(hist)} closed {tf} bars")
+    if skip_existing and conn is not None and conn.execute("select 1 from forecasts where symbol = %s and timeframe = %s and model = 'Kronos-small' and as_of = %s",
+                                         (symbol, tf, iso(hist["timestamps"].iloc[-1]))).fetchone():
+        raise AlreadyDone()   # the other trigger (GitHub schedule or Vercel cron dispatch) already ran this close
     y_ts = pd.Series(pd.date_range(hist["timestamps"].iloc[-1] + pd.Timedelta(seconds=cfg["sec"]), periods=h, freq=f"{cfg['sec']}s"))
     if feed == "stock" and tf == "1d":   # sessions, not calendar days
         y_ts = pd.Series(pd.bdate_range(hist["timestamps"].iloc[-1] + pd.Timedelta(days=1), periods=h) + pd.Timedelta(hours=hist["timestamps"].iloc[-1].hour))
@@ -279,7 +284,8 @@ def main():
         except Exception as e: print("promote skipped:", type(e).__name__)
     for sym, tf in [(s, t) for t in tfs for s in syms]:
         try:
-            row = forecast(pred, sym, tf)
+            try: row = forecast(pred, sym, tf, c, skip_existing=c is not None)
+            except AlreadyDone: print(f"{sym} {tf}: already forecast for this close, skipped"); done.append(f"{sym}:{tf}"); continue
             if DRY:
                 print(json.dumps(row["factlist"])); done.append(f"{sym}:{tf}")
                 if E("DUMP_ROWS"):  # local testing only: write full rows for db/load-rows.mjs
