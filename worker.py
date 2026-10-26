@@ -6,7 +6,7 @@ TIMEFRAMES (default "1h") picks which timeframes to run; "auto" runs every timef
   3) retention: drop `paths` JSONB on rows older than 90 days
   4) record the run in `worker_runs`, then exit
 On-demand jobs: ondemand.py (ondemand.yml, dispatched by the site with a job_id). News: news.py (news.yml, every 20 min).
-Env: DATABASE_URL (Neon direct URL), SYMBOLS, TIMEFRAMES, AUTO_PROMOTE_MAX, LOOKBACK, HORIZON, HORIZON_15M, HORIZON_4H, HORIZON_1D, PATHS, TEMP, TOP_P, TORCH_NUM_THREADS, DRY_RUN=1.
+Env: DATABASE_URL (Neon direct URL), SYMBOLS, TIMEFRAMES, AUTO_PROMOTE_MAX, LOOKBACK, HORIZON, HORIZON_5M, LOOKBACK_5M, PATHS_5M, HORIZON_15M, HORIZON_4H, HORIZON_1D, PATHS, TEMP, TOP_P, TORCH_NUM_THREADS, DRY_RUN=1.
 Timestamps (as_of, horizon_end, times_utc) are candle OPEN times in UTC, matching how Kronos stamps bars."""
 import json, math, os, sys, time, traceback
 from datetime import datetime, timezone, timedelta
@@ -31,12 +31,14 @@ iso = lambda t: pd.Timestamp(t).strftime("%Y-%m-%dT%H:%M:%SZ")
 # ---------- timeframes ----------
 # sec: bar length. horizon: bars ahead. base: upstream granularity fetched (4h is resampled from 1h; the primary feed has no 4h bars).
 TF = {
+    "5m":  {"sec": 300,   "horizon": int(E("HORIZON_5M", 12)),  "base": 300,
+            "ctx": int(E("LOOKBACK_5M", 480)), "paths": int(E("PATHS_5M", 20))},                 # next 60 minutes (experimental)
     "15m": {"sec": 900,   "horizon": int(E("HORIZON_15M", 16)), "base": 900},    # next 4 hours
     "1h":  {"sec": 3600,  "horizon": H,                          "base": 3600},   # next 24 hours (unchanged)
     "4h":  {"sec": 14400, "horizon": int(E("HORIZON_4H", 18)),  "base": 3600},   # next 3 days
     "1d":  {"sec": 86400, "horizon": int(E("HORIZON_1D", 7)),   "base": 86400},  # next 7 days
 }
-BACKUP_INTERVAL = {900: "15m", 3600: "1h", 14400: "4h", 86400: "1d"}
+BACKUP_INTERVAL = {300: "5m", 900: "15m", 3600: "1h", 14400: "4h", 86400: "1d"}
 
 def due_timeframes(now=None):
     """'auto': 1h every run; 4h when a 4h candle just closed; 1d at the daily close. 15m runs on its own schedule."""
@@ -97,7 +99,7 @@ def resample(df, sec):
     out = out[out["n"] == per].drop(columns="n").reset_index()
     return _frame(out[out["timestamps"] < _floor(sec)])
 
-STOCK_SRC = {"15m": ("15m", 1), "1h": ("1h", 1), "4h": ("1h", 4), "1d": ("1d", 1)}
+STOCK_SRC = {"5m": ("5m", 1), "15m": ("15m", 1), "1h": ("1h", 1), "4h": ("1h", 4), "1d": ("1d", 1)}
 
 def is_stock(symbol):
     import re
@@ -168,7 +170,7 @@ def build(symbol, feed, hist, paths, y_ts, runtime, tf="1h"):
         "invalidation_level": px(inval) if inval is not None else None,
         "hist_vol_over_horizon_pct": round(hv, 3) if hv is not None and math.isfinite(hv) else None,
         "p_close_above": {fmt_k(k): round(float((final > k).mean()), 3) for k in strikes},
-        "model": "Kronos-small", "sampling": {"T": T, "top_p": TOP_P, "paths": N, "seed": SEED},
+        "model": "Kronos-small", "sampling": {"T": T, "top_p": TOP_P, "paths": TF[tf].get("paths", N), "seed": SEED},
         "context_bars": int(len(hist)), "data_source": source, "disclaimer": DISCLAIMER,
     }
     pct = {f"p{q}": [px(v) for v in np.percentile(closes, q, axis=0)] for q in (10, 25, 50, 75, 90)}
@@ -185,8 +187,9 @@ class AlreadyDone(Exception): pass
 
 def forecast(pred, symbol, tf="1h", conn=None, skip_existing=False):
     torch.manual_seed(SEED); np.random.seed(SEED)
-    cfg = TF[tf]; h = cfg["horizon"]
-    hist, feed = candles(symbol, CTX, tf, conn)
+    cfg = TF[tf]; h = cfg["horizon"]; ctx, npaths = cfg.get("ctx", CTX), cfg.get("paths", N)
+    if tf == "5m" and is_stock(symbol): raise RuntimeError("5m is crypto-only")
+    hist, feed = candles(symbol, ctx, tf, conn)
     if len(hist) < 50: raise RuntimeError(f"only {len(hist)} closed {tf} bars")
     if skip_existing and conn is not None and conn.execute("select 1 from forecasts where symbol = %s and timeframe = %s and model = 'Kronos-small' and as_of = %s",
                                          (symbol, tf, iso(hist["timestamps"].iloc[-1]))).fetchone():
@@ -198,7 +201,7 @@ def forecast(pred, symbol, tf="1h", conn=None, skip_existing=False):
     # Sub-dollar assets (e.g. meme tokens) are rescaled so the model sees ~$100 prices; its normalisation breaks down near zero.
     last = float(hist["close"].iloc[-1]); k = 10.0 ** (2 - math.floor(math.log10(last))) if 0 < last < 1 else 1.0
     x = hist[["open", "high", "low", "close", "volume"]].copy(); x[["open", "high", "low", "close"]] *= k
-    paths = predict_paths(pred, x, hist["timestamps"], y_ts, h, T, TOP_P, N)
+    paths = predict_paths(pred, x, hist["timestamps"], y_ts, h, T, TOP_P, npaths)
     if k != 1.0: paths = paths.copy(); paths[:, :, :4] /= k
     return build(symbol, feed, hist, paths, y_ts, round(time.time() - t0, 1), tf)
 
@@ -256,7 +259,7 @@ def realized_close(symbol, venue, open_ts, tf="1h", c=None):
 def backfill(c):
     due = c.execute("""select f.id, f.symbol, f.venue, f.horizon_end, f.last_close, f.factlist->>'direction', f.factlist->'expected_range', f.timeframe
         from forecasts f left join outcomes o on o.forecast_id = f.id
-        where o.forecast_id is null and f.horizon_end + (case f.timeframe when '15m' then interval '15 minutes' when '4h' then interval '4 hours'
+        where o.forecast_id is null and f.horizon_end + (case f.timeframe when '5m' then interval '5 minutes' when '15m' then interval '15 minutes' when '4h' then interval '4 hours'
               when '1d' then interval '1 day' else interval '1 hour' end) <= now()
         order by f.horizon_end limit 200""").fetchall()
     n = 0

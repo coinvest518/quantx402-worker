@@ -1,0 +1,59 @@
+name: forecast-5m
+# NOT ENABLED: no schedule until Mild approves. Run manually only (workflow_dispatch).
+# Long-job loop (SPEC_5m_signal §3 Option B): one job loops up to 5h20m, dispatches its successor at 5h05m and exits as
+# soon as the successor logs its first OK cycle. Overlap is deduped by the forecasts unique key. Gaps go to data_quality.
+# STOP SWITCH: repo variable RUN_5M must equal 'true'. Otherwise the job is skipped and no successor is dispatched.
+# No workflow-level concurrency group: a fixed group would queue the successor behind the predecessor and break the
+# overlapping handover. Instead loop5m.py checks active runs of this workflow before dispatching and at startup.
+on:
+  workflow_dispatch: {}
+  # schedule:
+  #   - cron: "7 */6 * * *"   # safety relaunch if a handover dispatch fails (enable with Mild's OK)
+permissions:
+  contents: read
+  actions: write
+jobs:
+  loop:
+    if: ${{ vars.RUN_5M == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355   # loop hard-stops at 320 min (19,200 s) + ~5 min setup => ~30 min headroom
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      SYMBOLS_5M: BTC-USD,ETH-USD,SOL-USD,XRP-USD
+      HORIZON_5M: "12"
+      LOOKBACK_5M: "480"
+      PATHS_5M: "20"
+      TEMP: "1.0"
+      TOP_P: "0.9"
+      TORCH_NUM_THREADS: "4"
+      LOOP_SECONDS: "19200"
+      HANDOFF_AT: "18300"
+      RUN_5M: ${{ vars.RUN_5M }}
+      GH_RUN_ID: ${{ github.run_id }}
+      HF_HOME: ${{ github.workspace }}/.hf
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      GH_WORKFLOW: forecast-5m.yml
+      GH_REF: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install (CPU torch)
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch==2.5.1
+          pip install -r requirements.txt
+      - name: Cache model weights
+        uses: actions/cache@v6
+        with:
+          path: .hf
+          key: hf-kronos-small-v1
+      - name: Warm weights
+        run: python -c "from model import Kronos, KronosTokenizer; KronosTokenizer.from_pretrained('NeoQuasar/Kronos-Tokenizer-base'); Kronos.from_pretrained('NeoQuasar/Kronos-small')"
+      - name: 5m loop
+        env:
+          HF_HUB_OFFLINE: "1"
+        run: python loop5m.py

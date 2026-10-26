@@ -124,3 +124,49 @@ create table if not exists stock_bars (
   v double precision not null, vwap double precision, trade_count bigint,
   source text not null default 'market_feed', fetched_at timestamptz not null default now(),
   primary key (symbol, timeframe, ts));
+
+-- v12: 5m signal (SPEC_5m_signal). Additive only.
+alter table worker_runs add column if not exists timeframe text;
+alter table worker_runs add column if not exists runner text;   -- Actions run id; handover heartbeat
+create index if not exists forecasts_tf_sym_asof_idx on forecasts (timeframe, symbol, as_of desc);
+create index if not exists forecasts_5m_hend_idx on forecasts (horizon_end) where timeframe = '5m';
+create index if not exists forecasts_tf_model_asof_idx on forecasts (timeframe, model, as_of desc);   -- track record: latest N per timeframe+model without a sort
+create table if not exists data_quality (
+  id          bigint generated always as identity primary key,
+  ts          timestamptz not null default now(),
+  timeframe   text not null,
+  kind        text not null,               -- e.g. 'gap' (missed 5m slots at runner handover)
+  gap_start   timestamptz,
+  gap_end     timestamptz,
+  missed_bars int,
+  note        text
+);
+create index if not exists data_quality_ts_idx on data_quality (timeframe, ts desc);
+create index if not exists worker_runs_tf_started_idx on worker_runs (timeframe, started_at desc);
+-- Per (timeframe, model): a new model version starts its own record and gate.
+-- Directional-only accuracy (NEUTRAL excluded) with always-UP / always-DOWN baselines and Wilson 95% CI.
+drop view if exists v_tf_gate; drop view if exists v_tf_accuracy;   -- column set changed (model)
+create view v_tf_accuracy as
+with s as (
+  select f.timeframe, f.model, count(*)::float n, sum(o.direction_hit::int)::float hits,
+         sum((o.realized_close < f.last_close)::int)::float dn, sum((o.realized_close > f.last_close)::int)::float up
+  from forecasts f join outcomes o on o.forecast_id = f.id
+  where f.factlist->>'direction' in ('UP', 'DOWN') group by f.timeframe, f.model)
+select timeframe, model, n::int, hits::int,
+  ((hits/n + 1.9208/n) - 1.96*sqrt(hits/n*(1-hits/n)/n + 0.9604/(n*n))) / (1 + 3.8416/n) as wilson_lo,
+  ((hits/n + 1.9208/n) + 1.96*sqrt(hits/n*(1-hits/n)/n + 0.9604/(n*n))) / (1 + 3.8416/n) as wilson_hi,
+  dn/n as base_down, up/n as base_up
+from s;
+-- Rolling gate: last 300 directional calls per timeframe.
+create view v_tf_gate as
+with r as (
+  select f.timeframe, f.model, o.direction_hit, o.realized_close, f.last_close,
+         row_number() over (partition by f.timeframe, f.model order by f.as_of desc) rn
+  from forecasts f join outcomes o on o.forecast_id = f.id where f.factlist->>'direction' in ('UP', 'DOWN')),
+s as (select timeframe, model, count(*)::float n, sum(direction_hit::int)::float hits,
+        greatest(avg((realized_close < last_close)::int), avg((realized_close > last_close)::int)) b
+      from r where rn <= 300 group by timeframe, model)
+select timeframe, model, n::int, hits/n hit_rate, b baseline,
+  ((hits/n + 1.9208/n) - 1.96*sqrt(hits/n*(1-hits/n)/n + 0.9604/(n*n))) / (1 + 3.8416/n) as wilson_lo,
+  (n >= 300 and ((hits/n + 1.9208/n) - 1.96*sqrt(hits/n*(1-hits/n)/n + 0.9604/(n*n))) / (1 + 3.8416/n) > b) as voting
+from s;
