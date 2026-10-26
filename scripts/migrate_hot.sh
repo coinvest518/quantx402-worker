@@ -7,7 +7,7 @@
 set -euo pipefail
 : "${CORE_URL:?set CORE_URL}"; : "${HOT_URL:?set HOT_URL}"
 HOT_TABLES="requests free_trials skill_leads link_clicks downloads prediction_markets pm_snapshots news_items worker_runs data_quality market_cache coingecko_usage chat_rate_limits a2a_rate_limits stream_leases symbol_requests"
-T=""; for t in $HOT_TABLES stock_bars; do T="$T -t public.$t"; done
+T="-t public.stats_daily"; for t in $HOT_TABLES stock_bars; do T="$T -t public.$t"; done
 D=""; for t in $HOT_TABLES; do D="$D -t public.$t"; done
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 echo "1/4 schema"; pg_dump "$CORE_URL" --schema-only --no-owner --no-privileges $T > "$tmp/schema.sql"
