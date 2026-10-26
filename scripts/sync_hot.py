@@ -2,7 +2,7 @@
 
   forward  (core -> always-on): copies rows written on core since the previous copy. Run before AND right after the site deploy.
   reverse  (always-on -> core): rollback only. Copies rows written on the always-on DB after cutover (ids >= BUMP) back to core.
-  bump     (target only):       moves every identity/serial sequence to at least BUMP (default 1e9) and past max(id), so ids
+  bump     (target only):       moves the identity/serial sequences of the TABLES below (never forecasts/outcomes) to at least BUMP (default 1e9) and past max(id), so ids
                                 generated on one side never collide with ids copied from the other.
 
 How rows are copied:
@@ -28,6 +28,7 @@ from psycopg import sql as S
 TABLES = ["requests", "free_trials", "skill_leads", "link_clicks", "downloads", "prediction_markets", "pm_snapshots", "news_items",
           "worker_runs", "data_quality", "market_cache", "coingecko_usage", "chat_rate_limits", "a2a_rate_limits", "stream_leases",
           "symbol_requests", "stock_bars"]
+if os.environ.get("SYNC_TABLES"): TABLES = [t for t in os.environ["SYNC_TABLES"].split(",") if t in TABLES]   # tests only: subset
 MUTABLE = {"prediction_markets", "market_cache", "coingecko_usage", "chat_rate_limits", "a2a_rate_limits", "stream_leases", "worker_runs"}
 TS_COLS = ["ts", "created_at", "used_at", "ingested_at", "started_at", "published_at", "fetched_at", "first_seen", "updated_at", "window_start"]
 BUMP = int(os.environ.get("BUMP", "1000000000"))
@@ -109,6 +110,7 @@ def bump(dst, ds, dry):
         where n.nspname = %s and k.relkind = 'r' and a.attnum > 0 and not a.attisdropped
           and pg_get_serial_sequence(quote_ident(n.nspname) || '.' || quote_ident(k.relname), a.attname) is not null order by 1""", (ds,)).fetchall()
     for t, col, seq in rows:
+        if t not in TABLES: continue   # only the always-on tables; forecasts/outcomes ids (public forecast_id) never move
         mx = dst.execute(S.SQL("select coalesce(max({}), 0) from {}").format(S.Identifier(col), q(ds, t))).fetchone()[0]
         to = max(BUMP, mx + 1)
         if not dry: dst.execute("select setval(%s, %s, false)", (seq, to))

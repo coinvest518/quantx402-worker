@@ -1,0 +1,28 @@
+# TEMPORARY: one-off rehearsal of scripts/sync_hot.py against a scratch schema (sync_test) in the always-on DB and a Neon
+# dev branch. Production core is READ only. Removed in the next commit.
+name: tmp-sync-test
+on:
+  workflow_dispatch:
+    inputs:
+      branch_ep: { description: "Neon test branch endpoint id (ep-...)", required: true }
+permissions: { contents: read }
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CORE: ${{ secrets.DATABASE_URL }}
+      HOT: ${{ secrets.SUPABASE_DATABASE_URL }}
+      EP: ${{ inputs.branch_ep }}
+      SYNC_TABLES: requests,free_trials,skill_leads,link_clicks,downloads,prediction_markets,news_items,worker_runs,market_cache,coingecko_usage,chat_rate_limits,a2a_rate_limits,stream_leases,symbol_requests
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y >/dev/null 2>&1
+          sudo apt-get install -y -qq postgresql-client-18 >/dev/null
+          pip install -q "psycopg[binary]"
+      - name: run rehearsal
+        run: bash scripts/tmp_sync_test.sh
+      - name: drop scratch schema
+        if: always()
+        run: /usr/lib/postgresql/18/bin/psql "$HOT" -qc "drop schema if exists sync_test cascade" && echo "sync_test dropped"
