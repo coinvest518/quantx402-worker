@@ -8,7 +8,7 @@ URL, DRY, CAP = E("SUPABASE_DATABASE_URL", ""), E("DRY_RUN") == "1", int(E("HOT_
 NORMAL = [
     ("stock_bars", "timeframe = '15m' and ts < now() - interval '90 days'"),
     ("stock_bars", "timeframe = '1h' and ts < now() - interval '240 days'"),
-    ("pm_snapshots", "ts < now() - interval '60 days'"),
+    ("pm_snapshots", "ts < now() - interval '30 days'"),
     ("requests", "not paid and ts < now() - interval '180 days'"),
     ("news_items", "published_at < now() - interval '30 days'"),
     ("worker_runs", "started_at < now() - interval '30 days'"),
@@ -18,7 +18,7 @@ NORMAL = [
 TIGHT = [
     ("stock_bars", "timeframe = '15m' and ts < now() - interval '45 days'"),
     ("stock_bars", "timeframe = '1h' and ts < now() - interval '180 days'"),
-    ("pm_snapshots", "ts < now() - interval '30 days'"),
+    ("pm_snapshots", "ts < now() - interval '14 days'"),
     ("requests", "not paid and ts < now() - interval '60 days'"),
     ("worker_runs", "started_at < now() - interval '7 days'"),
 ]
