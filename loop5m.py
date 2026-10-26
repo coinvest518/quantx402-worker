@@ -14,6 +14,9 @@ predecessor in its handover window. The newest run always wins a real handover o
 Dispatch failures are retried with backoff; if all fail, a data_quality(kind='relaunch_failed') row is written and
 dispatch is retried every RETRY_EVERY s until the hard stop.
 DB: the connection is pinged before each cycle and reopened on OperationalError/InterfaceError (cycle retried once).
+If the retry fails again, or the reconnect itself fails (Neon down), the run never crashes: it logs an ERROR, tries to
+write data_quality(kind='cycle_failed'), drops the connection and carries on to the next slot (reconnecting then).
+worker_runs rows of failed cycles are finalized (finished_at, ok=false, error) right away or on the next good connect.
 Overlap never double-writes: forecasts has a unique (symbol, timeframe, model, as_of) key plus skip_existing.
 Env: DATABASE_URL, SYMBOLS_5M, LOOP_SECONDS, HANDOFF_AT, RUN_OFFSET, RUN_5M, GH_TOKEN, GH_REPO, GH_WORKFLOW, GH_RUN_ID,
 BACKLOG_WARN, DRY_RUN=1, MAX_ITER."""
@@ -51,6 +54,58 @@ def ensure_conn(c):
         try: c.close()
         except Exception: pass
         return w.db()
+
+_pending_runs = []   # worker_runs ids whose cycle failed before they could be finalized
+
+def finalize_pending(c, why="cycle_failed"):
+    """Close out worker_runs rows left open by failed cycles. Safe to call any time; keeps ids if the DB is down."""
+    if c is None or not _pending_runs: return 0
+    try:
+        for rid in list(_pending_runs):
+            c.execute("update worker_runs set finished_at = coalesce(finished_at, now()), ok = false, "
+                      "error = coalesce(error, %s) where id = %s and finished_at is null", (why, rid))
+            _pending_runs.remove(rid)
+        return 1
+    except Exception as e:
+        print("worker_runs finalize failed", type(e).__name__, file=sys.stderr); return 0
+
+def log_cycle_failed(c, err, slot_it):
+    print(f"ERROR cycle {slot_it} failed after retry: {type(err).__name__}; continuing to next slot", file=sys.stderr)
+    if c is None: return
+    try:
+        c.execute("insert into data_quality (timeframe, kind, note) values ('5m','cycle_failed',%s)",
+                  (f"runner {RUNNER} iter {slot_it}: {type(err).__name__}",))
+    except Exception as e: print("data_quality write failed", type(e).__name__, file=sys.stderr)
+
+def _drop(c):
+    if c is None: return None
+    try: c.close()
+    except Exception: pass
+    return None
+
+def connect(c):
+    """Live connection or raise. c=None means 'reconnect' (only used when not DRY)."""
+    c = w.db() if c is None else ensure_conn(c)
+    finalize_pending(c)
+    return c
+
+def safe_cycle(pred, c, it):
+    """Run one cycle; retry once on DB error; never raise. Returns the connection to use next (None = reconnect)."""
+    if w.DRY:
+        try: one_cycle(pred, None, it)
+        except Exception as e: log_cycle_failed(None, e, it)
+        return None
+    try:
+        c = connect(c); one_cycle(pred, c, it); return c
+    except Exception as e:
+        print("db: cycle failed", type(e).__name__, "- reconnecting and retrying once")
+        c = _drop(c)
+    try:
+        c = connect(None); one_cycle(pred, c, it); return c
+    except Exception as e:
+        log_cycle_failed(c, e, it)
+        finalize_pending(c)
+        return _drop(c)
 
 def next_slot(now=None):
     now = now or time.time()
@@ -166,6 +221,7 @@ def one_cycle(pred, c, it):
         try: g = record_gaps(c); g and print("gap bars recorded:", g)
         except Exception as e: errors.append(f"gaps: {type(e).__name__}")
         run_id = c.execute("insert into worker_runs (timeframe, runner) values ('5m', %s) returning id", (RUNNER,)).fetchone()[0]
+        _pending_runs.append(run_id)   # removed once finalized below; else closed out by finalize_pending
     for sym in SYMS:
         try:
             row = w.forecast(pred, sym, "5m", c, skip_existing=c is not None)
@@ -181,6 +237,7 @@ def one_cycle(pred, c, it):
             try: c.execute("update forecasts set paths = '[]'::jsonb where timeframe = '5m' and as_of < now() - interval '14 days' and paths <> '[]'::jsonb")
             except Exception as e: errors.append(f"retention: {type(e).__name__}")
         c.execute("update worker_runs set finished_at = now(), ok = %s, symbols_done = %s, error = %s where id = %s", (not errors, done, "; ".join(errors)[:2000] or None, run_id))
+        if run_id in _pending_runs: _pending_runs.remove(run_id)
     print(f"cycle {datetime.now(timezone.utc):%H:%M:%S}Z done={len(done)} err={len(errors)} {time.time()-t0:.1f}s")
 
 def main():
@@ -189,7 +246,10 @@ def main():
     from model import Kronos, KronosTokenizer, KronosPredictor
     tok = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-base"); mdl = Kronos.from_pretrained("NeoQuasar/Kronos-small")
     pred = KronosPredictor(mdl, tok, device="cpu", max_context=512)
-    c = None if w.DRY else w.db()
+    c = None
+    if not w.DRY:
+        try: c = w.db()
+        except Exception as e: print("ERROR db: unreachable at startup, will retry each cycle", type(e).__name__, file=sys.stderr)
     start, dispatched_at, it = time.time(), None, 0
     fail_round, next_retry = 0, None
     while True:
@@ -199,25 +259,25 @@ def main():
             if res == "ok": dispatched_at, next_retry = datetime.now(timezone.utc), None
             elif res == "skip": dispatched_at = datetime.max.replace(tzinfo=timezone.utc)
             else:
-                fail_round += 1; c = ensure_conn(c); log_relaunch_failed(c, fail_round)
+                fail_round += 1
+                try: c = None if w.DRY else connect(c)
+                except Exception as e: print("db: unreachable for relaunch_failed log", type(e).__name__, file=sys.stderr); c = _drop(c)
+                log_relaunch_failed(c, fail_round)
                 next_retry = time.time() + RETRY_EVERY
         slot = next_slot()
         if slot - start > LOOP: print("loop window over, exiting"); break
         time.sleep(max(0, slot - time.time()))
-        c = ensure_conn(c)
-        try: one_cycle(pred, c, it)
-        except _dberrs() as e:
-            print("db: cycle failed", type(e).__name__, "- reconnecting and retrying once")
-            try: c.close()
-            except Exception: pass
-            c = w.db(); one_cycle(pred, c, it)
+        c = safe_cycle(pred, c, it)
         it += 1
-        if c is not None and dispatched_at and dispatched_at.year < 9999 and successor_alive(c, dispatched_at):
-            print("handover: successor heartbeat seen, exiting"); break
+        alive = False
+        if c is not None and dispatched_at and dispatched_at.year < 9999:
+            try: alive = successor_alive(c, dispatched_at)
+            except Exception as e: print("db: successor check failed", type(e).__name__, file=sys.stderr); c = _drop(c)
+        if alive: print("handover: successor heartbeat seen, exiting"); break
         if dispatched_at is None and should_yield(other_runs(), E("GH_RUN_ID")):
             print("tie-break: older duplicate run active, exiting"); break
         if MAX_ITER and it >= MAX_ITER: break
-    if c is not None: c.close()
+    _drop(c)
 
 if __name__ == "__main__":
     main()

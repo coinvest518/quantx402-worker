@@ -70,4 +70,60 @@ class Reconnect(unittest.TestCase):
         with mock.patch.object(L.w, "db", return_value=new): self.assertIs(L.ensure_conn(bad), new)
         good = mock.MagicMock(); self.assertIs(L.ensure_conn(good), good)
 
+class CycleFailures(unittest.TestCase):
+    def setUp(self):
+        import psycopg; self.err = psycopg.OperationalError
+        L._pending_runs.clear()
+        mock.patch.object(L.w, "DRY", False).start()
+    def tearDown(self): mock.patch.stopall(); L._pending_runs.clear()
+    def _conn(self, run_id=7):
+        c = mock.MagicMock(); c.execute.return_value.fetchone.return_value = [run_id]; return c
+    def test_double_failure_never_raises(self):
+        c1, c2 = self._conn(), self._conn()
+        mock.patch.object(L.w, "db", return_value=c2).start()
+        mock.patch.object(L, "one_cycle", side_effect=self.err("boom")).start()
+        out = L.safe_cycle(None, c1, 3)
+        self.assertIsNone(out)                         # reset -> reconnect next slot
+        c1.close.assert_called(); c2.close.assert_called()
+        sqls = [a[0][0] for a in c2.execute.call_args_list]
+        self.assertTrue(any("cycle_failed" in s for s in sqls))
+    def test_reconnect_failure_never_raises(self):
+        c1 = self._conn(); c1.execute.side_effect = self.err("dropped")
+        mock.patch.object(L.w, "db", side_effect=self.err("neon down")).start()
+        self.assertIsNone(L.safe_cycle(None, c1, 0))
+        # next slot with DB still down also survives
+        self.assertIsNone(L.safe_cycle(None, None, 1))
+    def test_worker_runs_finalized_on_failure(self):
+        import worker as W
+        c = self._conn(42)
+        mock.patch.object(L, "SYMS", ["BTC-USD"]).start()
+        mock.patch.object(L, "record_gaps", return_value=0).start()
+        mock.patch.object(W, "forecast", side_effect=self.err("mid-cycle")).start()
+        # forecast errors are per-symbol; make save path fail fatally via backfill+final update
+        def ex(sql, *a):
+            if sql.startswith("update worker_runs set finished_at = now(), ok"): raise self.err("lost")
+            return mock.MagicMock(fetchone=mock.MagicMock(return_value=[42]))
+        c.execute.side_effect = ex
+        with self.assertRaises(self.err): L.one_cycle(None, c, 1)
+        self.assertEqual(L._pending_runs, [42])
+        c2 = mock.MagicMock(); self.assertEqual(L.finalize_pending(c2), 1)
+        sql, args = c2.execute.call_args[0]
+        self.assertIn("finished_at = coalesce", sql); self.assertEqual(args, ("cycle_failed", 42))
+        self.assertEqual(L._pending_runs, [])
+    def test_finalize_kept_when_db_down(self):
+        L._pending_runs.append(9)
+        bad = mock.MagicMock(); bad.execute.side_effect = self.err("down")
+        self.assertEqual(L.finalize_pending(bad), 0); self.assertEqual(L._pending_runs, [9])
+    def test_main_survives_db_outage_and_still_dispatches(self):
+        clock = [0.0]
+        def fake_sleep(s): clock[0] += max(s, 0)
+        with mock.patch.object(L, "HANDOFF_AT", 600), mock.patch.object(L, "LOOP", 1500), mock.patch.object(L, "MAX_ITER", 0), \
+             mock.patch.object(L.time, "time", lambda: clock[0]), mock.patch.object(L.time, "sleep", fake_sleep), \
+             mock.patch.object(L.w, "db", side_effect=self.err("neon down")), \
+             mock.patch.object(L, "dispatch_successor", return_value="ok") as d, \
+             mock.patch.object(L, "other_runs", return_value=[]), \
+             mock.patch.dict(sys.modules, {"model": mock.MagicMock()}), mock.patch.dict(os.environ, {"GH_RUN_ID": ""}):
+            L.main()
+        self.assertEqual(d.call_count, 1)
+
 if __name__ == "__main__": unittest.main()
