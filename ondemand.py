@@ -37,7 +37,8 @@ def main():
         from model import Kronos, KronosTokenizer, KronosPredictor
         tok = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-base"); mdl = Kronos.from_pretrained("NeoQuasar/Kronos-small")
         pred = KronosPredictor(mdl, tok, device="cpu", max_context=512)
-        row = W.forecast(pred, sym, tf, c)
+        h = W.hot_db(c)
+        row = W.forecast(pred, sym, tf, c, bars_conn=h)
         fid = W.save(c, row) or c.execute("select id from forecasts where symbol=%s and timeframe=%s and model=%s and as_of=%s", (sym, tf, row["model"], row["as_of"])).fetchone()[0]
         print(f"{jid} {sym} {tf} done id={fid} runtime={row['runtime_sec']}s")
     except Exception as e:

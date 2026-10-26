@@ -14,6 +14,7 @@ jobs:
     timeout-minutes: 5
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      SUPABASE_DATABASE_URL: ${{ secrets.SUPABASE_DATABASE_URL }}
       APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}   # social step is skipped when unset
     steps:
       - uses: actions/checkout@v7

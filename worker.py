@@ -23,6 +23,7 @@ CTX, H, N = int(E("LOOKBACK", 360)), int(E("HORIZON", 24)), int(E("PATHS", 30))
 T, TOP_P, SEED = float(E("TEMP", 1.0)), float(E("TOP_P", 0.9)), int(E("SEED", 42))
 torch.set_num_threads(int(E("TORCH_NUM_THREADS", 2)))
 DB = E("DATABASE_URL", "")
+HOT_DB = E("SUPABASE_DATABASE_URL", "")   # always-on DB for stock_bars / worker_runs / symbol_requests; unset = same as DATABASE_URL
 DRY = E("DRY_RUN") == "1" or not DB
 STRIKE_STEP = {"BTC": 500, "ETH": 25, "SOL": 1}
 DISCLAIMER = "Probabilistic model output for research and education. Not financial advice. Past results do not guarantee future results."
@@ -183,10 +184,10 @@ def build(symbol, feed, hist, paths, y_ts, runtime, tf="1h"):
 
 class AlreadyDone(Exception): pass
 
-def forecast(pred, symbol, tf="1h", conn=None, skip_existing=False):
+def forecast(pred, symbol, tf="1h", conn=None, skip_existing=False, bars_conn=None):
     torch.manual_seed(SEED); np.random.seed(SEED)
     cfg = TF[tf]; h = cfg["horizon"]
-    hist, feed = candles(symbol, CTX, tf, conn)
+    hist, feed = candles(symbol, CTX, tf, bars_conn if bars_conn is not None else conn)
     if len(hist) < 50: raise RuntimeError(f"only {len(hist)} closed {tf} bars")
     if skip_existing and conn is not None and conn.execute("select 1 from forecasts where symbol = %s and timeframe = %s and model = 'Kronos-small' and as_of = %s",
                                          (symbol, tf, iso(hist["timestamps"].iloc[-1]))).fetchone():
@@ -203,16 +204,18 @@ def forecast(pred, symbol, tf="1h", conn=None, skip_existing=False):
     return build(symbol, feed, hist, paths, y_ts, round(time.time() - t0, 1), tf)
 
 # ---------- schedule: config list + auto-promoted symbols ----------
-def promote(c):
-    """Promote frequently requested on-demand crypto pairs into tracked_symbols: >=5 requests from >=2 callers in 7 days, capped."""
-    c.execute("""insert into tracked_symbols (symbol, asset_class, origin, requests_7d, note)
-        select symbol, 'crypto', 'auto', n, 'auto-promoted from on-demand requests' from (
-          select symbol, count(*) n, count(distinct caller_hash) callers from symbol_requests
+def promote(c, h=None):
+    """Promote frequently requested on-demand crypto pairs into tracked_symbols: >=5 requests from >=2 callers in 7 days, capped.
+    symbol_requests lives on the always-on DB, tracked_symbols on the core DB, so read and write are separate queries."""
+    h = h if h is not None else c
+    cand = h.execute("""select symbol, count(*) n from symbol_requests
           where ts > now() - interval '7 days' and endpoint = 'on-demand' and asset_class = 'crypto' and outcome in ('queued', 'served_cached')
-          group by symbol) r
-        where n >= 5 and callers >= 2 and (select count(*) from tracked_symbols where origin = 'auto' and active) < %s
-        order by n desc limit %s
-        on conflict (symbol) do update set requests_7d = excluded.requests_7d""", (AUTO_MAX, AUTO_MAX))
+          group by symbol having count(*) >= 5 and count(distinct caller_hash) >= 2 order by n desc limit %s""", (AUTO_MAX,)).fetchall()
+    for sym, n in cand:
+        c.execute("""insert into tracked_symbols (symbol, asset_class, origin, requests_7d, note)
+            select %s, 'crypto', 'auto', %s, 'auto-promoted from on-demand requests'
+            where (select count(*) from tracked_symbols where origin = 'auto' and active) < %s
+            on conflict (symbol) do update set requests_7d = excluded.requests_7d""", (sym, n, AUTO_MAX))
 
 def scheduled_symbols(c):
     if c is None: return SYMBOLS
@@ -226,6 +229,13 @@ def scheduled_symbols(c):
 def db():
     import psycopg
     return psycopg.connect(DB, autocommit=True)
+
+def hot_db(core=None):
+    """Connection for the always-on tables. Falls back to the core connection (or a new core one) when unset.
+    prepare_threshold=None keeps it safe behind a transaction pooler."""
+    if not HOT_DB: return core if core is not None else db()
+    import psycopg
+    return psycopg.connect(HOT_DB, autocommit=True, prepare_threshold=None, connect_timeout=15)
 
 def save(c, row):
     from psycopg.types.json import Jsonb
@@ -253,7 +263,8 @@ def realized_close(symbol, venue, open_ts, tf="1h", c=None):
     r.raise_for_status()
     return next((float(x[4]) for x in r.json() if int(x[0]) == int(t.timestamp())), None)
 
-def backfill(c):
+def backfill(c, h=None):
+    h = h if h is not None else c
     due = c.execute("""select f.id, f.symbol, f.venue, f.horizon_end, f.last_close, f.factlist->>'direction', f.factlist->'expected_range', f.timeframe
         from forecasts f left join outcomes o on o.forecast_id = f.id
         where o.forecast_id is null and f.horizon_end + (case f.timeframe when '15m' then interval '15 minutes' when '4h' then interval '4 hours'
@@ -261,7 +272,7 @@ def backfill(c):
         order by f.horizon_end limit 200""").fetchall()
     n = 0
     for fid, sym, venue, hend, last, direction, rng, tf in due:
-        rc = realized_close(sym, venue, hend, tf, c)
+        rc = realized_close(sym, venue, hend, tf, h)
         if rc is None: continue
         hit = (rc > last) if direction == "UP" else (rc < last) if direction == "DOWN" else abs(rc / last - 1) < 0.005
         c.execute("insert into outcomes (forecast_id, realized_close, realized_move_pct, direction_hit, inside_band_80) values (%s,%s,%s,%s,%s) on conflict do nothing",
@@ -269,43 +280,71 @@ def backfill(c):
         n += 1; time.sleep(0.2)
     return n
 
+def mirror_tracked(c, h):
+    """Copy active auto-promoted symbols to the always-on DB so the next run can schedule without waking the core DB."""
+    rows = c.execute("select symbol, promoted_at from tracked_symbols where active and asset_class = 'crypto' and origin = 'auto'").fetchall()
+    h.execute("create table if not exists tracked_symbols_mirror (symbol text primary key, promoted_at timestamptz)")
+    h.execute("delete from tracked_symbols_mirror")
+    for sym, at in rows: h.execute("insert into tracked_symbols_mirror values (%s, %s) on conflict do nothing", (sym, at))
+
+def scheduled_symbols_hot(h):
+    try:
+        auto = [r[0] for r in h.execute("select symbol from tracked_symbols_mirror order by promoted_at limit %s", (AUTO_MAX,)).fetchall()]
+    except Exception: auto = []
+    return SYMBOLS + [s for s in auto if s not in SYMBOLS and re.match(CRYPTO_RE, s)]
+
 def main():
     hf = "NeoQuasar/"
     tok = KronosTokenizer.from_pretrained(hf + "Kronos-Tokenizer-base"); mdl = Kronos.from_pretrained(hf + "Kronos-small")
     pred = KronosPredictor(mdl, tok, device="cpu", max_context=512)
-    c = None if DRY else db()
-    run_id = None if DRY else c.execute("insert into worker_runs default values returning id").fetchone()[0]
-    done, errors = [], []
+    split = bool(HOT_DB) and not DRY
+    # Split mode: the core DB is opened only after inference, for one short write burst, so it can sleep between windows.
+    c = None if (DRY or split) else db()
+    h = None if DRY else hot_db(c)
+    run_id = None if DRY else h.execute("insert into worker_runs default values returning id").fetchone()[0]
+    done, errors, pending = [], [], []
     tfs = selected_timeframes()
     print("timeframes:", ",".join(tfs))
-    syms = scheduled_symbols(c)
+    syms = scheduled_symbols_hot(h) if split else scheduled_symbols(c)
     shard, shards = int(E("SHARD", "0")), max(1, int(E("SHARDS", "1")))
     syms = syms[shard::shards]   # matrix jobs split symbols so each run fits its cadence; shard 0 also scores outcomes
     if c is not None and "1h" in tfs and shard == 0:
-        try: promote(c)
+        try: promote(c, h)
         except Exception as e: print("promote skipped:", type(e).__name__)
     for sym, tf in [(s, t) for t in tfs for s in syms]:
         try:
-            try: row = forecast(pred, sym, tf, c, skip_existing=c is not None)
+            try: row = forecast(pred, sym, tf, c, skip_existing=c is not None, bars_conn=h)
             except AlreadyDone: print(f"{sym} {tf}: already forecast for this close, skipped"); done.append(f"{sym}:{tf}"); continue
             if DRY:
                 print(json.dumps(row["factlist"])); done.append(f"{sym}:{tf}")
                 if E("DUMP_ROWS"):  # local testing only: write full rows for db/load-rows.mjs
                     with open(E("DUMP_ROWS"), "a") as fh: fh.write(json.dumps(row) + "\n")
                 continue
+            if split: pending.append((sym, tf, row)); continue
             fid = save(c, row); done.append(f"{sym}:{tf}")
             print(f"{sym} {tf} as_of={row['as_of']} dir={row['factlist']['direction']} prob_up={row['prob_up']} runtime={row['runtime_sec']}s id={fid}")
         except Exception as e:
             errors.append(f"{sym} {tf}: {type(e).__name__}"); print(f"{sym} {tf} failed: {type(e).__name__}", file=sys.stderr)
     if not DRY:
+        if split:
+            c = db()
+            for sym, tf, row in pending:   # inserts are idempotent (on conflict do nothing), so no pre-check read is needed
+                try:
+                    fid = save(c, row); done.append(f"{sym}:{tf}")
+                    print(f"{sym} {tf} as_of={row['as_of']} dir={row['factlist']['direction']} prob_up={row['prob_up']} runtime={row['runtime_sec']}s id={fid}")
+                except Exception as e: errors.append(f"{sym} {tf}: {type(e).__name__}")
+            if "1h" in tfs and shard == 0:
+                try: promote(c, h); mirror_tracked(c, h)
+                except Exception as e: print("promote skipped:", type(e).__name__)
         if shard == 0:
-          try: print("outcomes filled:", backfill(c))
+          try: print("outcomes filled:", backfill(c, h))
           except Exception as e: errors.append(f"backfill: {type(e).__name__}")
         try: c.execute("update forecasts set paths = '[]'::jsonb where as_of < now() - interval '90 days' and paths <> '[]'::jsonb")
         except Exception as e: errors.append(f"retention: {type(e).__name__}")
-        c.execute("update worker_runs set finished_at = now(), ok = %s, symbols_done = %s, error = %s where id = %s",
+        if h is not c: c.close()
+        h.execute("update worker_runs set finished_at = now(), ok = %s, symbols_done = %s, error = %s where id = %s",
                   (not errors, done, "; ".join(errors)[:2000] or None, run_id))
-        c.close()
+        h.close()
     return 1 if errors else 0
 
 if __name__ == "__main__":

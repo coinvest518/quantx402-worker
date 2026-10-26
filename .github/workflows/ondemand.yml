@@ -17,6 +17,7 @@ jobs:
     timeout-minutes: 15
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      SUPABASE_DATABASE_URL: ${{ secrets.SUPABASE_DATABASE_URL }}
       SYMBOLS: BTC-USD,ETH-USD,SOL-USD,XRP-USD,BNB-USD,DOGE-USD,ADA-USD,AVAX-USD,LINK-USD,SUI-USD
       LOOKBACK: "360"
       PATHS: "30"
