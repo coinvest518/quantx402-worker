@@ -3,6 +3,8 @@
 # Usage (from a machine with pg_dump/psql 16+ that can reach both DBs on 5432):
 #   CORE_URL=<core direct url> HOT_URL=<always-on direct/session url, not the 6543 pooler> bash scripts/migrate_hot.sh
 # Safe to re-run on an empty target only. Never drops or deletes anything on the core DB.
+# Rows written between this copy and the cutover are caught up with scripts/sync_hot.py forward (run after the freeze);
+# rollback copies post-cutover rows back with scripts/sync_hot.py reverse. See db_split_plan.md "Cutover order".
 # After it finishes and the apps run on SUPABASE_DATABASE_URL for a few days, the moved tables can be dropped from core (separate approval).
 set -euo pipefail
 : "${CORE_URL:?set CORE_URL}"; : "${HOT_URL:?set HOT_URL}"

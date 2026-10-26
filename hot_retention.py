@@ -34,6 +34,10 @@ def run(c, rules):
 
 def main():
     if not URL: print("SUPABASE_DATABASE_URL unset: nothing to do"); return 0
+    from urllib.parse import urlsplit
+    host = (urlsplit(URL).hostname or "").lower()
+    if "neon.tech" in host or URL == E("DATABASE_URL", ""):
+        print("refusing: SUPABASE_DATABASE_URL points at the core DB; retention only runs on the always-on DB", file=sys.stderr); return 2
     import psycopg
     with psycopg.connect(URL, autocommit=True, prepare_threshold=None, connect_timeout=15) as c:
         before = size_mb(c); print(f"size before: {before:.0f} MB (cap {CAP})")

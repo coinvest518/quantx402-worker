@@ -284,8 +284,9 @@ def mirror_tracked(c, h):
     """Copy active auto-promoted symbols to the always-on DB so the next run can schedule without waking the core DB."""
     rows = c.execute("select symbol, promoted_at from tracked_symbols where active and asset_class = 'crypto' and origin = 'auto'").fetchall()
     h.execute("create table if not exists tracked_symbols_mirror (symbol text primary key, promoted_at timestamptz)")
-    h.execute("delete from tracked_symbols_mirror")
-    for sym, at in rows: h.execute("insert into tracked_symbols_mirror values (%s, %s) on conflict do nothing", (sym, at))
+    with h.transaction():   # readers never see an empty mirror; a failure keeps the previous list
+        h.execute("delete from tracked_symbols_mirror")
+        for sym, at in rows: h.execute("insert into tracked_symbols_mirror values (%s, %s) on conflict do nothing", (sym, at))
 
 def scheduled_symbols_hot(h):
     try:
@@ -300,12 +301,20 @@ def main():
     split = bool(HOT_DB) and not DRY
     # Split mode: the core DB is opened only after inference, for one short write burst, so it can sleep between windows.
     c = None if (DRY or split) else db()
-    h = None if DRY else hot_db(c)
-    run_id = None if DRY else h.execute("insert into worker_runs default values returning id").fetchone()[0]
+    h, hot_ok = None, False
+    if not DRY:
+        try: h = hot_db(c); hot_ok = True
+        except Exception as e:
+            # Always-on DB outage must not stop forecasting: fall back to the configured symbols and the core DB, skip the run log.
+            print(f"WARNING: always-on DB unreachable ({type(e).__name__}); using configured symbols + core DB, run log skipped", file=sys.stderr)
+            split = False
+            c = c if c is not None else db()
+            h = c
+    run_id = h.execute("insert into worker_runs default values returning id").fetchone()[0] if hot_ok else None
     done, errors, pending = [], [], []
     tfs = selected_timeframes()
     print("timeframes:", ",".join(tfs))
-    syms = scheduled_symbols_hot(h) if split else scheduled_symbols(c)
+    syms = scheduled_symbols_hot(h) if split else (scheduled_symbols(c) if (hot_ok or DRY) else list(SYMBOLS))
     shard, shards = int(E("SHARD", "0")), max(1, int(E("SHARDS", "1")))
     syms = syms[shard::shards]   # matrix jobs split symbols so each run fits its cadence; shard 0 also scores outcomes
     if c is not None and "1h" in tfs and shard == 0:
@@ -342,8 +351,9 @@ def main():
         try: c.execute("update forecasts set paths = '[]'::jsonb where as_of < now() - interval '90 days' and paths <> '[]'::jsonb")
         except Exception as e: errors.append(f"retention: {type(e).__name__}")
         if h is not c: c.close()
-        h.execute("update worker_runs set finished_at = now(), ok = %s, symbols_done = %s, error = %s where id = %s",
-                  (not errors, done, "; ".join(errors)[:2000] or None, run_id))
+        if run_id is not None:
+            h.execute("update worker_runs set finished_at = now(), ok = %s, symbols_done = %s, error = %s where id = %s",
+                      (not errors, done, "; ".join(errors)[:2000] or None, run_id))
         h.close()
     return 1 if errors else 0
 

@@ -1,7 +1,7 @@
 name: forecast-15m
 on:
   schedule:
-    - cron: "1,16,31,46 * * * *"   # 15m: one minute after each 15m candle closes
+    - cron: "1,31 * * * *"   # TEMPORARY until Oct 31 8 PM ET (core DB free-tier cap): every 30 min. Revert to "1,16,31,46" after.
   workflow_dispatch: {}
 concurrency:
   group: forecast-15m
