@@ -2,9 +2,10 @@
 # dev branch. Production core is READ only. Removed in the next commit.
 name: tmp-sync-test
 on:
-  workflow_dispatch:
-    inputs:
-      branch_ep: { description: "Neon test branch endpoint id (ep-...)", required: true }
+  # workflow_dispatch only works for workflows on the default branch, so this runs on a push to feat/db-split touching this file.
+  push:
+    branches: [feat/db-split]
+    paths: [.github/workflows/tmp-sync-test.yml]
 permissions: { contents: read }
 jobs:
   test:
@@ -13,7 +14,7 @@ jobs:
     env:
       CORE: ${{ secrets.DATABASE_URL }}
       HOT: ${{ secrets.SUPABASE_DATABASE_URL }}
-      EP: ${{ inputs.branch_ep }}
+      EP: ep-floral-violet-b8nkmrlt   # temporary Neon test branch endpoint (not a secret)
       SYNC_TABLES: requests,free_trials,skill_leads,link_clicks,downloads,prediction_markets,news_items,worker_runs,market_cache,coingecko_usage,chat_rate_limits,a2a_rate_limits,stream_leases,symbol_requests
     steps:
       - uses: actions/checkout@v4
