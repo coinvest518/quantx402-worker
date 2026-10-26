@@ -8,7 +8,12 @@ current run finishes its window and exits. Turning the chain off = set RUN_5M to
 
 Handover: at HANDOFF_AT seconds it dispatches its successor (only if RUN_5M is true and no other run of this workflow is
 already queued/in progress), keeps forecasting, and exits as soon as the successor writes its first OK heartbeat
-(or at LOOP_SECONDS, whichever is first). At startup a run exits if two or more other runs are already active.
+(or at LOOP_SECONDS, whichever is first). Tie-break: a run exits (at startup and after each cycle until it has been handed over to) if another active run
+has a lower run id and that older run started less than DUP_WINDOW s ago, i.e. it's a duplicate start, not a
+predecessor in its handover window. The newest run always wins a real handover once it has cycled.
+Dispatch failures are retried with backoff; if all fail, a data_quality(kind='relaunch_failed') row is written and
+dispatch is retried every RETRY_EVERY s until the hard stop.
+DB: the connection is pinged before each cycle and reopened on OperationalError/InterfaceError (cycle retried once).
 Overlap never double-writes: forecasts has a unique (symbol, timeframe, model, as_of) key plus skip_existing.
 Env: DATABASE_URL, SYMBOLS_5M, LOOP_SECONDS, HANDOFF_AT, RUN_OFFSET, RUN_5M, GH_TOKEN, GH_REPO, GH_WORKFLOW, GH_RUN_ID,
 BACKLOG_WARN, DRY_RUN=1, MAX_ITER."""
@@ -27,6 +32,25 @@ MAX_ITER = int(E("MAX_ITER", 0))
 BACKLOG_WARN = int(E("BACKLOG_WARN", 400))
 RUNNER = E("GH_RUN_ID") or f"local-{os.getpid()}"
 SEC = 300
+DUP_WINDOW = int(E("DUP_WINDOW", 3600))       # an older active run younger than this is a duplicate, not a predecessor
+RETRY_EVERY = int(E("RETRY_EVERY", 300))      # periodic re-dispatch after a failed handover
+BACKOFF = [int(x) for x in E("DISPATCH_BACKOFF", "5,15,45").split(",") if x]
+_sleep = time.sleep
+
+def _dberrs():
+    import psycopg
+    return (psycopg.OperationalError, psycopg.InterfaceError)
+
+def ensure_conn(c):
+    """Ping; reopen via w.db() if the server dropped the idle connection."""
+    if c is None: return None
+    try:
+        c.execute("select 1"); return c
+    except _dberrs() as e:
+        print("db: connection lost, reconnecting", type(e).__name__)
+        try: c.close()
+        except Exception: pass
+        return w.db()
 
 def next_slot(now=None):
     now = now or time.time()
@@ -61,26 +85,64 @@ def run5m_enabled():
     if v is None: print("stop switch: API read unavailable, using job-start value")
     return str(val).strip().lower() == "true"
 
-def other_active_runs():
-    wf = E("GH_WORKFLOW", "forecast-5m.yml"); n = 0
+def other_runs():
+    """Other queued/active runs of this workflow as dicts (id, run_started_at), or None if the API is unavailable."""
+    wf = E("GH_WORKFLOW", "forecast-5m.yml"); out = []
     for st in ("queued", "in_progress", "pending", "waiting"):
         d = _gh(f"actions/workflows/{wf}/runs?status={st}&per_page=20")
         if d is None: return None
-        n += sum(1 for x in d.get("workflow_runs", []) if str(x.get("id")) != str(E("GH_RUN_ID")))
-    return n
+        out += [x for x in d.get("workflow_runs", []) if str(x.get("id")) != str(E("GH_RUN_ID"))]
+    return out
 
-def dispatch_successor():
+def other_active_runs():
+    r = other_runs(); return None if r is None else len(r)
+
+def _ts(x):
+    v = x.get("run_started_at") or x.get("created_at")
+    try: return datetime.fromisoformat(str(v).replace("Z", "+00:00")).timestamp()
+    except Exception: return None
+
+def should_yield(runs, my_id, now=None):
+    """Deterministic tie-break: yield iff some other active run has a lower id AND started < DUP_WINDOW ago
+    (a duplicate). An older run past DUP_WINDOW is a predecessor handing over, so we stay."""
+    if not runs or not str(my_id or "").isdigit(): return False
+    now = now or time.time()
+    for x in runs:
+        try: oid = int(x.get("id"))
+        except Exception: continue
+        t = _ts(x)
+        if oid < int(my_id) and t is not None and now - t < DUP_WINDOW: return True
+    return False
+
+def _post_dispatch():
     tok, repo, wf = E("GH_TOKEN"), E("GH_REPO"), E("GH_WORKFLOW", "forecast-5m.yml")
-    if not run5m_enabled(): print("handover: RUN_5M is not 'true', not relaunching (chain stops)"); return False
-    if not (tok and repo): print("handover: no GH_TOKEN/GH_REPO, not relaunching"); return False
-    act = other_active_runs()
-    if act: print(f"handover: {act} other run(s) already active, not dispatching"); return False
     try:
         r = requests.post(f"https://api.github.com/repos/{repo}/actions/workflows/{wf}/dispatches",
                           headers={"Authorization": f"Bearer {tok}", "Accept": "application/vnd.github+json"}, json={"ref": E("GH_REF", "main")}, timeout=20)
-        print("handover: successor dispatched" if r.status_code == 204 else f"handover: dispatch HTTP {r.status_code}"); return r.status_code == 204
+        if r.status_code == 204: return True
+        print(f"handover: dispatch HTTP {r.status_code}")
     except Exception as e:
-        print("handover: dispatch failed", type(e).__name__); return False
+        print("handover: dispatch failed", type(e).__name__)
+    return False
+
+def dispatch_successor():
+    """Returns 'ok' (dispatched), 'skip' (intentional: switch off / no token / successor already active) or 'failed'."""
+    if not run5m_enabled(): print("handover: RUN_5M is not 'true', not relaunching (chain stops)"); return "skip"
+    if not (E("GH_TOKEN") and E("GH_REPO")): print("handover: no GH_TOKEN/GH_REPO, not relaunching"); return "skip"
+    act = other_active_runs()
+    if act: print(f"handover: {act} other run(s) already active, not dispatching"); return "ok"
+    for i, wait in enumerate([0] + BACKOFF):
+        if wait: _sleep(wait)
+        if _post_dispatch(): print("handover: successor dispatched"); return "ok"
+    return "failed"
+
+def log_relaunch_failed(c, attempt):
+    print(f"ERROR handover: successor dispatch failed after retries (attempt round {attempt}); will retry every {RETRY_EVERY}s", file=sys.stderr)
+    if c is None: return
+    try:
+        c.execute("insert into data_quality (timeframe, kind, note) values ('5m','relaunch_failed',%s)",
+                  (f"runner {RUNNER} round {attempt}",))
+    except Exception as e: print("data_quality write failed", type(e).__name__, file=sys.stderr)
 
 def successor_alive(c, since):
     """True once a different runner has logged an OK 5m cycle after we dispatched."""
@@ -123,22 +185,37 @@ def one_cycle(pred, c, it):
 
 def main():
     if E("GH_RUN_ID") and not run5m_enabled(): print("RUN_5M is not 'true', exiting"); return
-    act = other_active_runs()
-    if act is not None and act >= 2: print(f"{act} other runs active, exiting to avoid a duplicate chain"); return
+    if should_yield(other_runs(), E("GH_RUN_ID")): print("tie-break: an older run started recently, exiting as duplicate"); return
     from model import Kronos, KronosTokenizer, KronosPredictor
     tok = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-base"); mdl = Kronos.from_pretrained("NeoQuasar/Kronos-small")
     pred = KronosPredictor(mdl, tok, device="cpu", max_context=512)
     c = None if w.DRY else w.db()
     start, dispatched_at, it = time.time(), None, 0
+    fail_round, next_retry = 0, None
     while True:
-        if dispatched_at is None and time.time() - start >= HANDOFF_AT:
-            dispatched_at = datetime.now(timezone.utc) if dispatch_successor() else datetime.max.replace(tzinfo=timezone.utc)
+        el = time.time() - start
+        if dispatched_at is None and (el >= HANDOFF_AT if next_retry is None else time.time() >= next_retry):
+            res = dispatch_successor()
+            if res == "ok": dispatched_at, next_retry = datetime.now(timezone.utc), None
+            elif res == "skip": dispatched_at = datetime.max.replace(tzinfo=timezone.utc)
+            else:
+                fail_round += 1; c = ensure_conn(c); log_relaunch_failed(c, fail_round)
+                next_retry = time.time() + RETRY_EVERY
         slot = next_slot()
         if slot - start > LOOP: print("loop window over, exiting"); break
         time.sleep(max(0, slot - time.time()))
-        one_cycle(pred, c, it); it += 1
+        c = ensure_conn(c)
+        try: one_cycle(pred, c, it)
+        except _dberrs() as e:
+            print("db: cycle failed", type(e).__name__, "- reconnecting and retrying once")
+            try: c.close()
+            except Exception: pass
+            c = w.db(); one_cycle(pred, c, it)
+        it += 1
         if c is not None and dispatched_at and dispatched_at.year < 9999 and successor_alive(c, dispatched_at):
             print("handover: successor heartbeat seen, exiting"); break
+        if dispatched_at is None and should_yield(other_runs(), E("GH_RUN_ID")):
+            print("tie-break: older duplicate run active, exiting"); break
         if MAX_ITER and it >= MAX_ITER: break
     if c is not None: c.close()
 
