@@ -130,6 +130,7 @@ alter table worker_runs add column if not exists timeframe text;
 alter table worker_runs add column if not exists runner text;   -- Actions run id; handover heartbeat
 create index if not exists forecasts_tf_sym_asof_idx on forecasts (timeframe, symbol, as_of desc);
 create index if not exists forecasts_5m_hend_idx on forecasts (horizon_end) where timeframe = '5m';
+create index if not exists forecasts_tf_model_asof_idx on forecasts (timeframe, model, as_of desc);   -- track record: latest N per timeframe+model without a sort
 create table if not exists data_quality (
   id          bigint generated always as identity primary key,
   ts          timestamptz not null default now(),
