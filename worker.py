@@ -118,6 +118,13 @@ def stock_candles(c, symbol, bars, tf):
     return _frame(df.tail(bars)), "stock"
 
 def candles(symbol, bars, tf="1h", conn=None):
+    # TEMPORARY seed helper (temp/core-on-hot only): SEED_LAG_BARS=N ends the input N bars early, so a fresh DB gets a run old enough for /basic.
+    lag = int(E("SEED_LAG_BARS", "0") or 0)
+    df, src = _candles(symbol, bars + lag, tf, conn)
+    if lag: df = df.iloc[:-lag].tail(bars).reset_index(drop=True)
+    return df, src
+
+def _candles(symbol, bars, tf="1h", conn=None):
     if is_stock(symbol): return stock_candles(conn, symbol, bars, tf)
     cfg = TF[tf]; sec, base = cfg["sec"], cfg["base"]
     need = bars * (sec // base) + (sec // base)

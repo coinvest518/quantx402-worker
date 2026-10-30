@@ -9,7 +9,7 @@ concurrency: { group: core-on-hot, cancel-in-progress: false }
 jobs:
   run:
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 60
     env:
       HOT: ${{ secrets.SUPABASE_DATABASE_URL }}
       HF_HOME: ${{ github.workspace }}/.hf
@@ -36,8 +36,11 @@ jobs:
         run: |
           pip install -q --index-url https://download.pytorch.org/whl/cpu torch==2.5.1
           pip install -q -r requirements.txt
-      - name: forecast once (1h, 3 symbols)
-        env: { SYMBOLS: "BTC-USD,ETH-USD,SOL-USD", TIMEFRAMES: "1h", LOOKBACK: "360", PATHS: "30", TEMP: "1.0", TOP_P: "0.9", TORCH_NUM_THREADS: "4" }
+      - name: seed run ending 5 bars early (all 10 symbols)
+        env: { SEED_LAG_BARS: "5", SYMBOLS: "BTC-USD,ETH-USD,SOL-USD,XRP-USD,BNB-USD,DOGE-USD,ADA-USD,AVAX-USD,LINK-USD,SUI-USD", TIMEFRAMES: "1h", LOOKBACK: "360", PATHS: "30", TEMP: "1.0", TOP_P: "0.9", TORCH_NUM_THREADS: "4" }
+        run: DATABASE_URL="$HOT_SESSION" SUPABASE_DATABASE_URL="$HOT" python worker.py
+      - name: forecast once (1h, all 10 symbols)
+        env: { SYMBOLS: "BTC-USD,ETH-USD,SOL-USD,XRP-USD,BNB-USD,DOGE-USD,ADA-USD,AVAX-USD,LINK-USD,SUI-USD", TIMEFRAMES: "1h", LOOKBACK: "360", PATHS: "30", TEMP: "1.0", TOP_P: "0.9", TORCH_NUM_THREADS: "4" }
         run: DATABASE_URL="$HOT_SESSION" SUPABASE_DATABASE_URL="$HOT" python worker.py
       - name: news + markets (never fail)
         continue-on-error: true
