@@ -1,0 +1,52 @@
+# TEMPORARY (Neon quota outage until 2026-10-31 8 PM ET): build the full schema on the always-on DB and run the worker once against it.
+# Runs only on pushes to temp/core-on-hot. Never touches the core DB.
+name: core-on-hot
+on:
+  push:
+    branches: [temp/core-on-hot]
+permissions: { contents: read }
+concurrency: { group: core-on-hot, cancel-in-progress: false }
+jobs:
+  run:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      HOT: ${{ secrets.SUPABASE_DATABASE_URL }}
+      HF_HOME: ${{ github.workspace }}/.hf
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: urls
+        run: |
+          [ -n "$HOT" ] || { echo "missing secret"; exit 1; }
+          S=$(python3 -c "import os;print(os.environ['HOT'].replace(':6543/', ':5432/'))"); echo "::add-mask::$S"
+          echo "HOT_SESSION=$S" >> "$GITHUB_ENV"
+      - name: tools
+        run: |
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y >/dev/null 2>&1
+          sudo apt-get install -y -qq postgresql-client-18 >/dev/null
+      - name: schema
+        run: |
+          export PATH=/usr/lib/postgresql/18/bin:$PATH
+          psql "$HOT_SESSION" -v ON_ERROR_STOP=1 -q -f scripts/core_schema.sql
+          psql "$HOT_SESSION" -v ON_ERROR_STOP=1 -q -f schema.sql
+          psql "$HOT_SESSION" -At -c "select string_agg(table_name, ' ' order by table_name) from information_schema.tables where table_schema='public'"
+      - name: install worker
+        run: |
+          pip install -q --index-url https://download.pytorch.org/whl/cpu torch==2.5.1
+          pip install -q -r requirements.txt
+      - name: forecast once (1h, 3 symbols)
+        env: { SYMBOLS: "BTC-USD,ETH-USD,SOL-USD", TIMEFRAMES: "1h", LOOKBACK: "360", PATHS: "30", TEMP: "1.0", TOP_P: "0.9", TORCH_NUM_THREADS: "4" }
+        run: DATABASE_URL="$HOT_SESSION" SUPABASE_DATABASE_URL="$HOT" python worker.py
+      - name: news + markets (never fail)
+        continue-on-error: true
+        run: |
+          DATABASE_URL="$HOT_SESSION" SUPABASE_DATABASE_URL="$HOT" timeout 120 python news.py || true
+          DATABASE_URL="$HOT_SESSION" SUPABASE_DATABASE_URL="$HOT" PM_BUDGET_SEC=50 timeout 120 python polymarket.py || true
+      - name: counts
+        if: always()
+        run: |
+          export PATH=/usr/lib/postgresql/18/bin:$PATH
+          for t in forecasts outcomes worker_runs news_items prediction_markets requests free_trials stock_bars; do echo "$t $(psql "$HOT_SESSION" -At -c "select count(*) from $t" 2>&1)"; done
+          psql "$HOT_SESSION" -c "select pg_size_pretty(pg_database_size(current_database())) as db_size"
