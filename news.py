@@ -10,7 +10,7 @@ import xml.etree.ElementTree as ET
 import requests
 
 E = os.environ.get
-DB = E("DATABASE_URL", "")
+DB = E("SUPABASE_DATABASE_URL", "") or E("DATABASE_URL", "")
 DRY = E("DRY_RUN") == "1" or not DB
 MAX_AGE = timedelta(hours=float(E("NEWS_MAX_AGE_H", 72)))
 BUDGET = float(E("NEWS_BUDGET_SEC", 60))
@@ -237,7 +237,7 @@ def main():
     if DRY:
         print(json.dumps({"stats": stats, "count": len(rows), "rows": rows[:10]}, indent=1)); return 0
     import psycopg
-    with psycopg.connect(DB, autocommit=True) as c:
+    with psycopg.connect(DB, autocommit=True, prepare_threshold=None) as c:
         n = store(c, rows)
     print(json.dumps({**stats, "candidates": len(rows), "inserted": n}))
     return 0

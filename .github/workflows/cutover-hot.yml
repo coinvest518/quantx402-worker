@@ -1,0 +1,47 @@
+# DB split cutover steps (core -> always-on). Manual only; each step needs the owner's OK. Order: db_split_plan.md "Cutover order".
+name: cutover-hot
+on:
+  workflow_dispatch:
+    inputs:
+      step:
+        description: "Which step to run"
+        type: choice
+        default: dry-run
+        options: [dry-run, initial, forward-upsert, bump, forward, reverse-upsert, bump-neon]
+permissions: { contents: read }
+concurrency: { group: cutover-hot, cancel-in-progress: false }
+jobs:
+  run:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CORE: ${{ secrets.DATABASE_URL }}
+      HOT: ${{ secrets.SUPABASE_DATABASE_URL }}
+      STEP: ${{ inputs.step }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: tools
+        run: |
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y >/dev/null 2>&1
+          sudo apt-get install -y -qq postgresql-client-18 >/dev/null
+          pip install -q "psycopg[binary]"
+      - name: run step
+        run: |
+          set -euo pipefail
+          export PATH=/usr/lib/postgresql/18/bin:$PATH
+          [ -n "$CORE" ] && [ -n "$HOT" ] || { echo "missing secret"; exit 1; }
+          case "$STEP" in
+            dry-run)        SRC_URL="$CORE" DST_URL="$HOT" python3 scripts/sync_hot.py forward --upsert --dry-run
+                            DST_URL="$HOT" python3 scripts/sync_hot.py bump --dry-run ;;
+            initial)        # migrate_hot.sh wants a session connection: same pooler host, session port 5432 instead of 6543
+                            HOT_SESSION=$(python3 -c "import os;print(os.environ['HOT'].replace(':6543/', ':5432/'))"); echo "::add-mask::$HOT_SESSION"
+                            CORE_URL="$CORE" HOT_URL="$HOT_SESSION" bash scripts/migrate_hot.sh ;;
+            forward-upsert) SRC_URL="$CORE" DST_URL="$HOT" python3 scripts/sync_hot.py forward --upsert ;;
+            bump)           DST_URL="$HOT" python3 scripts/sync_hot.py bump ;;
+            forward)        SRC_URL="$CORE" DST_URL="$HOT" python3 scripts/sync_hot.py forward
+                            echo "== rerun (expect TOTAL 0)"; SRC_URL="$CORE" DST_URL="$HOT" python3 scripts/sync_hot.py forward ;;
+            reverse-upsert) SRC_URL="$HOT" DST_URL="$CORE" python3 scripts/sync_hot.py reverse --upsert
+                            echo "== rerun (expect TOTAL 0)"; SRC_URL="$HOT" DST_URL="$CORE" python3 scripts/sync_hot.py reverse --upsert ;;
+            bump-neon)      DST_URL="$CORE" python3 scripts/sync_hot.py bump ;;
+            *) echo "unknown step"; exit 2 ;;
+          esac

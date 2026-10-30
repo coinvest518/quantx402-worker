@@ -1,0 +1,24 @@
+name: hot-retention
+on:
+  schedule:
+    - cron: "50 7 * * *"   # daily; touches only the always-on DB (skips when SUPABASE_DATABASE_URL is unset)
+  workflow_dispatch: {}
+concurrency:
+  group: hot-retention
+  cancel-in-progress: false
+permissions:
+  contents: read
+jobs:
+  run:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      SUPABASE_DATABASE_URL: ${{ secrets.SUPABASE_DATABASE_URL }}
+      HOT_CAP_MB: "400"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip install "psycopg[binary]>=3.2"
+      - run: python hot_retention.py

@@ -143,12 +143,12 @@ def run(conn=None):
     return len(uniq), errors
 
 if __name__ == "__main__":
-    db = E("DATABASE_URL", "")
+    db = E("SUPABASE_DATABASE_URL", "") or E("DATABASE_URL", "")
     if E("DRY_RUN") == "1" or not db:
         run(None); sys.exit(0)
     import psycopg
     try:
-        with psycopg.connect(db, autocommit=True, connect_timeout=15) as c: run(c)
+        with psycopg.connect(db, autocommit=True, connect_timeout=15, prepare_threshold=None) as c: run(c)
     except Exception as e:
         print(f"polymarket: db connect failed: {e}", file=sys.stderr)
     sys.exit(0)  # never break the workflow

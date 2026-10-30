@@ -41,7 +41,7 @@ def get(params):
 def main():
     if not HDR["APCA-API-KEY-ID"] or not HDR["APCA-API-SECRET-KEY"]: sys.exit("ALPACA keys missing")
     import psycopg
-    con = psycopg.connect(E("DATABASE_URL"), autocommit=True)
+    con = psycopg.connect(E("SUPABASE_DATABASE_URL") or E("DATABASE_URL"), autocommit=True, prepare_threshold=None)
     con.execute(DDL)
     con.execute("alter table stock_bars alter column source set default 'market_feed'")
     con.execute("update stock_bars set source=%s where source <> %s", (SRC, SRC))
