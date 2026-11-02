@@ -131,19 +131,22 @@ def main():
     url = os.environ.get("DATABASE_URL")
     if not url: print("DATABASE_URL missing", file=sys.stderr); return 0
     if not os.path.exists(MODEL_PATH): print("rationale model file missing; skipping", file=sys.stderr); return 0
+    # Read, close, generate, then reconnect for one short write burst: the core DB sleeps while the model runs.
     with psycopg.connect(url, autocommit=True) as c:
         rows = c.execute("""select distinct on (b.symbol) b.id, b.symbol, b.forecast_id, b.rationale_inputs from briefs b
             where b.created_at > now() - interval '90 minutes' and b.rationale_inputs is not null
               and not exists (select 1 from brief_rationales r where r.symbol = b.symbol and r.forecast_id = b.forecast_id)
             order by b.symbol, b.created_at desc limit %s""", (MAX_BRIEFS,)).fetchall()
-        ok = bad = 0
-        for bid, sym, fid, inp in rows:
-            text, why, ms = generate(inp)
-            if text:
-                c.execute("insert into brief_rationales (brief_id, symbol, forecast_id, text, model, latency_ms) values (%s,%s,%s,%s,%s,%s)", (bid, sym, fid, text, MODEL_ID, ms)); ok += 1
-            else: bad += 1
-            print(f"{sym} forecast={fid} {'stored' if text else 'rejected:' + str(why)} {ms}ms")
-        print(f"rationales stored={ok} rejected={bad}")
+    out, bad = [], 0
+    for bid, sym, fid, inp in rows:
+        text, why, ms = generate(inp)
+        if text: out.append((bid, sym, fid, text, MODEL_ID, ms))
+        else: bad += 1
+        print(f"{sym} forecast={fid} {'ok' if text else 'rejected:' + str(why)} {ms}ms")
+    if out:
+        with psycopg.connect(url, autocommit=True) as c:
+            for r in out: c.execute("insert into brief_rationales (brief_id, symbol, forecast_id, text, model, latency_ms) values (%s,%s,%s,%s,%s,%s)", r)
+    print(f"rationales stored={len(out)} rejected={bad}")
     return 0
 
 if __name__ == "__main__":
