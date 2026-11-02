@@ -127,23 +127,36 @@ def generate(inp, tries=2):
         last = why
     return None, last, int((time.time() - t0) * 1000)
 
+def wait_for_write_slot():
+    """Hold the write until the next forecast flush slot (minute % 15 == WRITE_SLOT_MIN, default 11) so it lands
+    inside a window the core DB is already awake for, instead of opening a new 5-minute wake. Capped at 15 min."""
+    slot = int(os.environ.get("WRITE_SLOT_MIN", "11"))
+    if slot < 0: return
+    now = time.time(); m = (now // 60) % 15
+    wait = ((slot - m) % 15) * 60 - (now % 60)
+    if 0 < wait <= 900: print(f"waiting {int(wait)}s for the write slot"); time.sleep(wait)
+
 def main():
     url = os.environ.get("DATABASE_URL")
     if not url: print("DATABASE_URL missing", file=sys.stderr); return 0
     if not os.path.exists(MODEL_PATH): print("rationale model file missing; skipping", file=sys.stderr); return 0
+    # Read, close, generate, then reconnect for one short write burst: the core DB sleeps while the model runs.
     with psycopg.connect(url, autocommit=True) as c:
         rows = c.execute("""select distinct on (b.symbol) b.id, b.symbol, b.forecast_id, b.rationale_inputs from briefs b
             where b.created_at > now() - interval '90 minutes' and b.rationale_inputs is not null
               and not exists (select 1 from brief_rationales r where r.symbol = b.symbol and r.forecast_id = b.forecast_id)
             order by b.symbol, b.created_at desc limit %s""", (MAX_BRIEFS,)).fetchall()
-        ok = bad = 0
-        for bid, sym, fid, inp in rows:
-            text, why, ms = generate(inp)
-            if text:
-                c.execute("insert into brief_rationales (brief_id, symbol, forecast_id, text, model, latency_ms) values (%s,%s,%s,%s,%s,%s)", (bid, sym, fid, text, MODEL_ID, ms)); ok += 1
-            else: bad += 1
-            print(f"{sym} forecast={fid} {'stored' if text else 'rejected:' + str(why)} {ms}ms")
-        print(f"rationales stored={ok} rejected={bad}")
+    out, bad = [], 0
+    for bid, sym, fid, inp in rows:
+        text, why, ms = generate(inp)
+        if text: out.append((bid, sym, fid, text, MODEL_ID, ms))
+        else: bad += 1
+        print(f"{sym} forecast={fid} {'ok' if text else 'rejected:' + str(why)} {ms}ms")
+    if out:
+        wait_for_write_slot()
+        with psycopg.connect(url, autocommit=True) as c:
+            for r in out: c.execute("insert into brief_rationales (brief_id, symbol, forecast_id, text, model, latency_ms) values (%s,%s,%s,%s,%s,%s)", r)
+    print(f"rationales stored={len(out)} rejected={bad}")
     return 0
 
 if __name__ == "__main__":

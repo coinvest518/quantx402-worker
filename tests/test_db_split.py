@@ -77,6 +77,43 @@ class Split(unittest.TestCase):
         self.assertTrue(any(n == "core" and "tracked_symbols" in q for n, q in log))
         self.assertFalse(any(n == "core" and "symbol_requests" in q for n, q in log))
 
+class Outbox(unittest.TestCase):
+    def test_outbox_never_opens_core(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        rc, log, opened, events = Split.run_main(Split(), {"SUPABASE_DATABASE_URL": "hot", "OUTBOX_DIR": d})
+        self.assertEqual(rc, 0)
+        self.assertNotIn("core", [o[0] for o in opened], "shards never touch the core DB in outbox mode")
+        self.assertFalse(any(e[0] in ("save", "backfill") for e in events))
+        self.assertTrue(os.path.exists(os.path.join(d, "shard-0.jsonl")))
+
+    def run_flush(self, rows, hot="hot"):
+        import tempfile, json
+        d = tempfile.mkdtemp(); os.makedirs(os.path.join(d, "outbox-1"))
+        with open(os.path.join(d, "outbox-1", "shard-1.jsonl"), "w") as fh:
+            for r in rows: fh.write(json.dumps(r) + "\n")
+        W = load({"DATABASE_URL": "core", "SUPABASE_DATABASE_URL": hot})
+        log, opened = [], []
+        def mk(name):
+            def f(*a, **k): c = Conn(name, log); opened.append(name); return c
+            return f
+        with mock.patch.object(W, "db", side_effect=mk("core")), mock.patch("psycopg.connect", side_effect=mk("hot")), \
+             mock.patch.object(W, "save", return_value=5), mock.patch.object(W, "backfill", return_value=0), \
+             mock.patch.object(sys, "argv", ["worker.py", "flush", d]):
+            rc = W.main()
+        return rc, log, opened
+
+    def test_flush_one_core_connection_and_marks(self):
+        rc, log, opened = self.run_flush([{**ROW, "symbol": "BTC-USD", "timeframe": "15m"}, {**ROW, "symbol": "ETH-USD", "timeframe": "15m"}])
+        self.assertEqual(rc, 0)
+        self.assertEqual(opened.count("core"), 1)
+        self.assertTrue(any(n == "hot" and "forecast_marks" in q for n, q in log))
+        self.assertTrue(any(n == "hot" and "worker_runs" in q for n, q in log))
+
+    def test_empty_flush_leaves_core_asleep(self):
+        rc, log, opened = self.run_flush([])
+        self.assertEqual(rc, 0); self.assertEqual(opened, [])
+
 class Retention(unittest.TestCase):
     def test_noop_when_unset(self):
         with mock.patch.dict(os.environ, {"SUPABASE_DATABASE_URL": ""}):

@@ -15,6 +15,7 @@ jobs:
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
       SUPABASE_DATABASE_URL: ${{ secrets.SUPABASE_DATABASE_URL }}
+      OUTBOX_DIR: outbox   # used only when SUPABASE_DATABASE_URL is set (split mode)
       SYMBOLS: BTC-USD,ETH-USD,SOL-USD,XRP-USD,BNB-USD,DOGE-USD,ADA-USD,AVAX-USD,LINK-USD,SUI-USD
       LOOKBACK: "360"
       PATHS: "30"
@@ -45,3 +46,37 @@ jobs:
         env:
           HF_HUB_OFFLINE: "1"
         run: python worker.py
+      - name: Upload outbox
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: outbox-${{ strategy.job-index }}
+          path: outbox/
+          if-no-files-found: ignore
+          retention-days: 1
+  flush:
+    # One short core-DB write burst per run (all shards), so the core DB sleeps between windows.
+    needs: run
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      SUPABASE_DATABASE_URL: ${{ secrets.SUPABASE_DATABASE_URL }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: outbox-*
+          path: outbox
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install (CPU torch)
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch==2.5.1
+          pip install -r requirements.txt
+      - name: Write all shards to the core DB in one burst
+        run: python worker.py flush outbox

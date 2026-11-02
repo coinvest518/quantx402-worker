@@ -11,6 +11,7 @@ Timestamps (as_of, horizon_end, times_utc) are candle OPEN times in UTC, matchin
 import json, math, os, sys, time, traceback
 from datetime import datetime, timezone, timedelta
 import numpy as np, pandas as pd, requests, torch
+_ARGV = list(sys.argv)   # 'worker.py flush <dir>' is read from here (argv is cleared below)
 sys.argv = sys.argv[:1]
 from kronos_paths import predict_paths
 from model import Kronos, KronosTokenizer, KronosPredictor
@@ -23,6 +24,7 @@ CTX, H, N = int(E("LOOKBACK", 360)), int(E("HORIZON", 24)), int(E("PATHS", 30))
 T, TOP_P, SEED = float(E("TEMP", 1.0)), float(E("TOP_P", 0.9)), int(E("SEED", 42))
 torch.set_num_threads(int(E("TORCH_NUM_THREADS", 2)))
 DB = E("DATABASE_URL", "")
+OUTBOX = E("OUTBOX_DIR", "")   # split mode: shards write rows here and the workflow's flush job writes them to the core DB in one burst
 HOT_DB = E("SUPABASE_DATABASE_URL", "")   # always-on DB for stock_bars / worker_runs / symbol_requests; unset = same as DATABASE_URL
 DRY = E("DRY_RUN") == "1" or not DB
 STRIKE_STEP = {"BTC": 500, "ETH": 25, "SOL": 1}
@@ -184,7 +186,7 @@ def build(symbol, feed, hist, paths, y_ts, runtime, tf="1h"):
 
 class AlreadyDone(Exception): pass
 
-def forecast(pred, symbol, tf="1h", conn=None, skip_existing=False, bars_conn=None):
+def forecast(pred, symbol, tf="1h", conn=None, skip_existing=False, bars_conn=None, marks_conn=None):
     torch.manual_seed(SEED); np.random.seed(SEED)
     cfg = TF[tf]; h = cfg["horizon"]
     hist, feed = candles(symbol, CTX, tf, bars_conn if bars_conn is not None else conn)
@@ -192,6 +194,9 @@ def forecast(pred, symbol, tf="1h", conn=None, skip_existing=False, bars_conn=No
     if skip_existing and conn is not None and conn.execute("select 1 from forecasts where symbol = %s and timeframe = %s and model = 'Kronos-small' and as_of = %s",
                                          (symbol, tf, iso(hist["timestamps"].iloc[-1]))).fetchone():
         raise AlreadyDone()   # the other trigger (GitHub schedule or Vercel cron dispatch) already ran this close
+    if marks_conn is not None and marks_conn.execute("select 1 from forecast_marks where symbol = %s and timeframe = %s and model = 'Kronos-small' and as_of = %s",
+                                                     (symbol, tf, iso(hist["timestamps"].iloc[-1]))).fetchone():
+        raise AlreadyDone()   # split mode: the core DB is not opened just to check; the flush records written closes in the always-on DB
     y_ts = pd.Series(pd.date_range(hist["timestamps"].iloc[-1] + pd.Timedelta(seconds=cfg["sec"]), periods=h, freq=f"{cfg['sec']}s"))
     if feed == "stock" and tf == "1d":   # sessions, not calendar days
         y_ts = pd.Series(pd.bdate_range(hist["timestamps"].iloc[-1] + pd.Timedelta(days=1), periods=h) + pd.Timedelta(hours=hist["timestamps"].iloc[-1].hour))
@@ -294,7 +299,64 @@ def scheduled_symbols_hot(h):
     except Exception: auto = []
     return SYMBOLS + [s for s in auto if s not in SYMBOLS and re.match(CRYPTO_RE, s)]
 
+MARKS_DDL = ("create table if not exists forecast_marks (symbol text not null, timeframe text not null, model text not null, as_of timestamptz not null,"
+             " forecast_id bigint, written_at timestamptz not null default now(), primary key (symbol, timeframe, model, as_of))")
+
+def has_marks(h):
+    try: return h.execute("select to_regclass('public.forecast_marks') is not null").fetchone()[0]
+    except Exception: return False
+
+def write_marks(h, rows):
+    """Record written closes in the always-on DB (dedupe for the second trigger + health without waking the core DB)."""
+    h.execute(MARKS_DDL)
+    for r, fid in rows:
+        h.execute("insert into forecast_marks (symbol, timeframe, model, as_of, forecast_id) values (%s,%s,%s,%s,%s) on conflict do nothing",
+                  (r["symbol"], r["timeframe"], r.get("model", "Kronos-small"), r["as_of"], fid))
+    h.execute("delete from forecast_marks where as_of < now() - interval '3 days'")
+
+def flush(paths):
+    """One short core-DB burst for a whole run: every shard's outbox rows, promotion, scoring and retention, then close.
+    Shards finish minutes apart; writing them together keeps the core DB awake ~5 min per window instead of ~8."""
+    rows = []
+    for p in paths:
+        with open(p) as fh: rows += [json.loads(l) for l in fh if l.strip()]
+    print(f"flush: {len(rows)} rows from {len(paths)} outbox files")
+    if DRY or not rows: return 0   # nothing new (second trigger for the same close): leave the core DB asleep
+    tfs = sorted({r["timeframe"] for r in rows})
+    h = None
+    try: h = hot_db() if HOT_DB else None
+    except Exception as e: print(f"WARNING: always-on DB unreachable ({type(e).__name__}); marks skipped", file=sys.stderr)
+    errors, saved = [], []
+    c = db()
+    run_id = None
+    try:
+        for row in rows:
+            try:
+                fid = save(c, row); saved.append((row, fid))
+                print(f"{row['symbol']} {row['timeframe']} as_of={row['as_of']} id={fid}")
+            except Exception as e: errors.append(f"{row['symbol']} {row['timeframe']}: {type(e).__name__}")
+        if "1h" in tfs:
+            try: promote(c, h); (mirror_tracked(c, h) if h is not None else None)
+            except Exception as e: print("promote skipped:", type(e).__name__)
+        try: print("outcomes filled:", backfill(c, h if h is not None else c))
+        except Exception as e: errors.append(f"backfill: {type(e).__name__}")
+        try: c.execute("update forecasts set paths = '[]'::jsonb where as_of < now() - interval '90 days' and paths <> '[]'::jsonb")
+        except Exception as e: errors.append(f"retention: {type(e).__name__}")
+    finally: c.close()
+    if h is not None:
+        try:
+            write_marks(h, saved)
+            h.execute("insert into worker_runs (finished_at, ok, symbols_done, error) values (now(), %s, %s, %s)",
+                      (not errors, [f"{r['symbol']}:{r['timeframe']}" for r, _ in saved], ("flush: " + "; ".join(errors))[:2000] if errors else None))
+        except Exception as e: print(f"WARNING: marks/run log failed ({type(e).__name__})", file=sys.stderr)
+        h.close()
+    return 1 if errors else 0
+
 def main():
+    argv = _ARGV if len(_ARGV) > 1 else sys.argv
+    if len(argv) > 2 and argv[1] == "flush":
+        import glob
+        return flush(sorted(glob.glob(os.path.join(argv[2], "**", "*.jsonl"), recursive=True)))
     hf = "NeoQuasar/"
     tok = KronosTokenizer.from_pretrained(hf + "Kronos-Tokenizer-base"); mdl = Kronos.from_pretrained(hf + "Kronos-small")
     pred = KronosPredictor(mdl, tok, device="cpu", max_context=512)
@@ -315,6 +377,8 @@ def main():
     tfs = selected_timeframes()
     print("timeframes:", ",".join(tfs))
     syms = scheduled_symbols_hot(h) if split else (scheduled_symbols(c) if (hot_ok or DRY) else list(SYMBOLS))
+    marks = split and has_marks(h)
+    outbox = split and bool(OUTBOX)   # rows go to a file; the workflow's flush job writes all shards to the core DB at once
     shard, shards = int(E("SHARD", "0")), max(1, int(E("SHARDS", "1")))
     syms = syms[shard::shards]   # matrix jobs split symbols so each run fits its cadence; shard 0 also scores outcomes
     if c is not None and "1h" in tfs and shard == 0:
@@ -322,7 +386,7 @@ def main():
         except Exception as e: print("promote skipped:", type(e).__name__)
     for sym, tf in [(s, t) for t in tfs for s in syms]:
         try:
-            try: row = forecast(pred, sym, tf, c, skip_existing=c is not None, bars_conn=h)
+            try: row = forecast(pred, sym, tf, c, skip_existing=c is not None, bars_conn=h, marks_conn=h if (split and marks) else None)
             except AlreadyDone: print(f"{sym} {tf}: already forecast for this close, skipped"); done.append(f"{sym}:{tf}"); continue
             if DRY:
                 print(json.dumps(row["factlist"])); done.append(f"{sym}:{tf}")
@@ -334,14 +398,28 @@ def main():
             print(f"{sym} {tf} as_of={row['as_of']} dir={row['factlist']['direction']} prob_up={row['prob_up']} runtime={row['runtime_sec']}s id={fid}")
         except Exception as e:
             errors.append(f"{sym} {tf}: {type(e).__name__}"); print(f"{sym} {tf} failed: {type(e).__name__}", file=sys.stderr)
+    if not DRY and outbox:
+        os.makedirs(OUTBOX, exist_ok=True)
+        with open(os.path.join(OUTBOX, f"shard-{shard}.jsonl"), "w") as fh:
+            for sym, tf, row in pending: fh.write(json.dumps(row) + "\n"); done.append(f"{sym}:{tf}")
+        print(f"outbox: {len(pending)} rows -> {OUTBOX}")
+        if run_id is not None:
+            h.execute("update worker_runs set finished_at = now(), ok = %s, symbols_done = %s, error = %s where id = %s",
+                      (not errors, done, "; ".join(errors)[:2000] or None, run_id))
+        h.close()
+        return 1 if errors else 0
     if not DRY:
         if split:
             c = db()
+            saved = []
             for sym, tf, row in pending:   # inserts are idempotent (on conflict do nothing), so no pre-check read is needed
                 try:
-                    fid = save(c, row); done.append(f"{sym}:{tf}")
+                    fid = save(c, row); done.append(f"{sym}:{tf}"); saved.append((row, fid))
                     print(f"{sym} {tf} as_of={row['as_of']} dir={row['factlist']['direction']} prob_up={row['prob_up']} runtime={row['runtime_sec']}s id={fid}")
                 except Exception as e: errors.append(f"{sym} {tf}: {type(e).__name__}")
+            if hot_ok and h is not c:
+                try: write_marks(h, saved)
+                except Exception as e: print("marks skipped:", type(e).__name__)
             if "1h" in tfs and shard == 0:
                 try: promote(c, h); mirror_tracked(c, h)
                 except Exception as e: print("promote skipped:", type(e).__name__)
