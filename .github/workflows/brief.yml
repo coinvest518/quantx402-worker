@@ -1,7 +1,7 @@
 name: brief
 on:
   schedule:
-    - cron: "25 * * * *"   # backup; the site's scheduler dispatches at :20 after warming briefs at :15
+    - cron: "9 * * * *"   # backup inside the :01-:12 write window; the site dispatches at :07 after warming briefs at :06
   workflow_dispatch: {}
 concurrency:
   group: brief
