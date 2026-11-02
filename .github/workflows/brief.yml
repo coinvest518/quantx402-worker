@@ -1,7 +1,7 @@
 name: brief
 on:
   schedule:
-    - cron: "9 * * * *"   # backup inside the :01-:12 write window; the site dispatches at :07 after warming briefs at :06
+    - cron: "13 * * * *"   # backup; the site dispatches at :12 after warming briefs; writes wait for the next flush slot
   workflow_dispatch: {}
 concurrency:
   group: brief
@@ -11,7 +11,7 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 35
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
       SUPABASE_DATABASE_URL: ${{ secrets.SUPABASE_DATABASE_URL }}
