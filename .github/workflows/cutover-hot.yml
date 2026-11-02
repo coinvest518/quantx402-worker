@@ -7,7 +7,7 @@ on:
         description: "Which step to run"
         type: choice
         default: dry-run
-        options: [dry-run, initial, forward-upsert, bump, forward, reverse-upsert, bump-neon]
+        options: [dry-run, initial, forward-upsert, bump, forward, reverse-upsert, bump-neon, init-live-dry, init-live, rollback-live]
 permissions: { contents: read }
 concurrency: { group: cutover-hot, cancel-in-progress: false }
 jobs:
@@ -43,5 +43,8 @@ jobs:
             reverse-upsert) SRC_URL="$HOT" DST_URL="$CORE" python3 scripts/sync_hot.py reverse --upsert
                             echo "== rerun (expect TOTAL 0)"; SRC_URL="$HOT" DST_URL="$CORE" python3 scripts/sync_hot.py reverse --upsert ;;
             bump-neon)      DST_URL="$CORE" python3 scripts/sync_hot.py bump ;;
+            init-live-dry)  CORE_URL="$CORE" HOT_URL="$HOT" python3 scripts/init_live.py --dry-run ;;
+            init-live)      CORE_URL="$CORE" HOT_URL="$HOT" python3 scripts/init_live.py ;;
+            rollback-live)  CORE_URL="$CORE" HOT_URL="$HOT" python3 scripts/init_live.py --rollback ;;
             *) echo "unknown step"; exit 2 ;;
           esac

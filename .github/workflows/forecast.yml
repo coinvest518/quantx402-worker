@@ -1,7 +1,7 @@
 name: forecast
 on:
   schedule:
-    - cron: "3 * * * *"   # 1h: minute 3 every hour UTC (the site cron backs this up at :05)
+    - cron: "6 * * * *"   # 1h backup; the site dispatches at :05 so the flush lands ~:12 with the hourly core sync
   workflow_dispatch: {}
 concurrency:
   group: forecast
@@ -19,6 +19,7 @@ jobs:
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
       SUPABASE_DATABASE_URL: ${{ secrets.SUPABASE_DATABASE_URL }}
+      FORECASTS_LIVE: ${{ vars.FORECASTS_LIVE }}   # "1" = always-on DB first, hourly core sync (repo variable, off by default)
       OUTBOX_DIR: outbox   # used only when SUPABASE_DATABASE_URL is set (split mode)
       SYMBOLS: BTC-USD,ETH-USD,SOL-USD,XRP-USD,BNB-USD,DOGE-USD,ADA-USD,AVAX-USD,LINK-USD,SUI-USD
       LOOKBACK: "360"
@@ -76,6 +77,7 @@ jobs:
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
       SUPABASE_DATABASE_URL: ${{ secrets.SUPABASE_DATABASE_URL }}
+      FORECASTS_LIVE: ${{ vars.FORECASTS_LIVE }}   # "1" = always-on DB first, hourly core sync (repo variable, off by default)
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v5
