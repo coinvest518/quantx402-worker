@@ -11,6 +11,7 @@ Timestamps (as_of, horizon_end, times_utc) are candle OPEN times in UTC, matchin
 import json, math, os, sys, time, traceback
 from datetime import datetime, timezone, timedelta
 import numpy as np, pandas as pd, requests, torch
+_ARGV = list(sys.argv)   # 'worker.py flush <dir>' is read from here (argv is cleared below)
 sys.argv = sys.argv[:1]
 from kronos_paths import predict_paths
 from model import Kronos, KronosTokenizer, KronosPredictor
@@ -352,9 +353,10 @@ def flush(paths):
     return 1 if errors else 0
 
 def main():
-    if len(sys.argv) > 2 and sys.argv[1] == "flush":
+    argv = _ARGV if len(_ARGV) > 1 else sys.argv
+    if len(argv) > 2 and argv[1] == "flush":
         import glob
-        return flush(sorted(glob.glob(os.path.join(sys.argv[2], "**", "*.jsonl"), recursive=True)))
+        return flush(sorted(glob.glob(os.path.join(argv[2], "**", "*.jsonl"), recursive=True)))
     hf = "NeoQuasar/"
     tok = KronosTokenizer.from_pretrained(hf + "Kronos-Tokenizer-base"); mdl = Kronos.from_pretrained(hf + "Kronos-small")
     pred = KronosPredictor(mdl, tok, device="cpu", max_context=512)
