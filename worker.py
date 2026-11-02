@@ -354,6 +354,8 @@ def sync_core(h, c):
                   "on conflict do nothing", vals)
         n += 1
     if rows:
+        # keep the core identity past the copied ids so any core-side insert (rollback / live off) can't collide
+        c.execute("select setval(pg_get_serial_sequence('forecasts', 'id'), (select max(id) from forecasts))")
         h.execute("update forecasts set synced = true, paths = '[]'::jsonb where id = any(%s)", ([r[0] for r in rows],))
     h.execute("delete from forecasts where synced and as_of < now() - interval '3 days'")
     return n
