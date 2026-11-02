@@ -27,6 +27,10 @@ DB = E("DATABASE_URL", "")
 OUTBOX = E("OUTBOX_DIR", "")   # split mode: shards write rows here and the workflow's flush job writes them to the core DB in one burst
 HOT_DB = E("SUPABASE_DATABASE_URL", "")   # always-on DB for stock_bars / worker_runs / symbol_requests; unset = same as DATABASE_URL
 DRY = E("DRY_RUN") == "1" or not DB
+# Live mode: forecasts land in the always-on DB first (ids from its identity, seeded past the core max by scripts/init_live.py)
+# and are copied to the core DB in one hourly burst, so the core DB wakes once an hour instead of every 15 minutes.
+LIVE = E("FORECASTS_LIVE") == "1" and bool(HOT_DB)
+CORE_SYNC_MAX_AGE_MIN = int(E("CORE_SYNC_MAX_AGE_MIN", "50"))
 STRIKE_STEP = {"BTC": 500, "ETH": 25, "SOL": 1}
 DISCLAIMER = "Probabilistic model output for research and education. Not financial advice. Past results do not guarantee future results."
 iso = lambda t: pd.Timestamp(t).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -314,6 +318,80 @@ def write_marks(h, rows):
                   (r["symbol"], r["timeframe"], r.get("model", "Kronos-small"), r["as_of"], fid))
     h.execute("delete from forecast_marks where as_of < now() - interval '3 days'")
 
+# ---------- live mode (always-on DB first, hourly core sync) ----------
+FCOLS = ["symbol", "venue", "timeframe", "model", "as_of", "horizon_bars", "horizon_end", "context_bars", "sampling", "last_close",
+         "prob_up", "expected_move_pct", "band_80_pct", "factlist", "percentiles", "paths", "runtime_sec"]
+JSONB = ("sampling", "factlist", "percentiles", "paths")
+
+def live_ready(h):
+    try: return h.execute("select 1 from information_schema.columns where table_schema = 'public' and table_name = 'forecasts' and column_name = 'synced'").fetchone() is not None
+    except Exception: return False
+
+def save_live(h, row):
+    """Insert into the always-on forecasts table (unsynced). Same unique key as the core table, so re-runs are no-ops."""
+    from psycopg.types.json import Jsonb
+    cols = [k for k in FCOLS if k in row]
+    vals = {k: (Jsonb(row[k]) if k in JSONB else row[k]) for k in cols}
+    r = h.execute(f"insert into forecasts ({', '.join(cols)}, synced) values ({', '.join('%(' + k + ')s' for k in cols)}, false) "
+                  "on conflict (symbol, timeframe, model, as_of) do nothing returning id", vals).fetchone()
+    return r[0] if r else None
+
+def core_sync_due(h, tfs, force=False, now=None):
+    """Hourly: the run that carries 1h rows, the first quarter of the hour, or anything left unsynced too long."""
+    now = now or datetime.now(timezone.utc)
+    if force or "1h" in tfs or now.minute < 15: return True
+    r = h.execute("select count(*) from forecasts where not synced and created_at < now() - make_interval(mins => %s)", (CORE_SYNC_MAX_AGE_MIN,)).fetchone()
+    return bool(r and r[0])
+
+def sync_core(h, c):
+    """Copy unsynced always-on rows to the core DB with the same ids, then mark them synced and drop their paths there."""
+    from psycopg.types.json import Jsonb
+    rows = h.execute(f"select id, {', '.join(FCOLS)}, created_at from forecasts where not synced order by id").fetchall()
+    n = 0
+    for r in rows:
+        vals = [Jsonb(v) if k in JSONB and v is not None else v for k, v in zip(["id"] + FCOLS + ["created_at"], r)]
+        c.execute(f"insert into forecasts (id, {', '.join(FCOLS)}, created_at) overriding system value values ({', '.join(['%s'] * len(vals))}) "
+                  "on conflict do nothing", vals)
+        n += 1
+    if rows:
+        # keep the core identity past the copied ids so any core-side insert (rollback / live off) can't collide
+        c.execute("select setval(pg_get_serial_sequence('forecasts', 'id'), (select max(id) from forecasts))")
+        h.execute("update forecasts set synced = true, paths = '[]'::jsonb where id = any(%s)", ([r[0] for r in rows],))
+    h.execute("delete from forecasts where synced and as_of < now() - interval '3 days'")
+    return n
+
+def flush_live(rows, force_core=False, shard0=True):
+    """Live-mode flush: rows to the always-on DB every window; the core DB only when an hourly sync is due."""
+    tfs = sorted({r["timeframe"] for r in rows})
+    h = hot_db()
+    errors, saved = [], []
+    try:
+        for row in rows:
+            try:
+                fid = save_live(h, row); saved.append((row, fid))
+                print(f"{row['symbol']} {row['timeframe']} as_of={row['as_of']} id={fid} (always-on)")
+            except Exception as e: errors.append(f"{row['symbol']} {row['timeframe']}: {type(e).__name__}")
+        write_marks(h, saved)
+        if core_sync_due(h, tfs, force_core):
+            c = db()
+            try:
+                print("core sync:", sync_core(h, c), "rows")
+                if "1h" in tfs or force_core:
+                    try: promote(c, h); mirror_tracked(c, h)
+                    except Exception as e: print("promote skipped:", type(e).__name__)
+                if shard0:
+                    try: print("outcomes filled:", backfill(c, h))
+                    except Exception as e: errors.append(f"backfill: {type(e).__name__}")
+                try: c.execute("update forecasts set paths = '[]'::jsonb where as_of < now() - interval '90 days' and paths <> '[]'::jsonb")
+                except Exception as e: errors.append(f"retention: {type(e).__name__}")
+            except Exception as e: errors.append(f"core sync: {type(e).__name__}")
+            finally: c.close()
+        else: print("core sync: not due (core DB left asleep)")
+        h.execute("insert into worker_runs (finished_at, ok, symbols_done, error) values (now(), %s, %s, %s)",
+                  (not errors, [f"{r['symbol']}:{r['timeframe']}" for r, _ in saved], ("flush: " + "; ".join(errors))[:2000] if errors else None))
+    finally: h.close()
+    return saved, errors
+
 def flush(paths):
     """One short core-DB burst for a whole run: every shard's outbox rows, promotion, scoring and retention, then close.
     Shards finish minutes apart; writing them together keeps the core DB awake ~5 min per window instead of ~8."""
@@ -322,6 +400,11 @@ def flush(paths):
         with open(p) as fh: rows += [json.loads(l) for l in fh if l.strip()]
     print(f"flush: {len(rows)} rows from {len(paths)} outbox files")
     if DRY or not rows: return 0   # nothing new (second trigger for the same close): leave the core DB asleep
+    if LIVE:
+        try: probe = hot_db(); ok = live_ready(probe); probe.close()
+        except Exception: ok = False
+        if ok: return 1 if flush_live(rows)[1] else 0
+        print("WARNING: live mode set but always-on forecasts table not ready; writing to the core DB", file=sys.stderr)
     tfs = sorted({r["timeframe"] for r in rows})
     h = None
     try: h = hot_db() if HOT_DB else None
@@ -409,6 +492,15 @@ def main():
         h.close()
         return 1 if errors else 0
     if not DRY:
+        if split and LIVE and live_ready(h):
+            saved, errs = flush_live([row for _, _, row in pending], force_core=True, shard0=(shard == 0))
+            errors += errs; done += [f"{r['symbol']}:{r['timeframe']}" for r, _ in saved]
+            if run_id is not None:
+                try: h.execute("update worker_runs set finished_at = now(), ok = %s, symbols_done = %s, error = %s where id = %s",
+                               (not errors, done, "; ".join(errors)[:2000] or None, run_id))
+                except Exception: pass
+            h.close()
+            return 1 if errors else 0
         if split:
             c = db()
             saved = []

@@ -133,3 +133,23 @@ class Retention(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class Live(unittest.TestCase):
+    def setUp(self):
+        import worker; self.w = worker
+    def test_sync_due_hourly(self):
+        from datetime import datetime, timezone
+        h = mock.MagicMock(); h.execute.return_value.fetchone.return_value = (0,)
+        at = lambda m: datetime(2026, 11, 2, 19, m, tzinfo=timezone.utc)
+        self.assertTrue(self.w.core_sync_due(h, ["15m"], now=at(11)))     # first quarter of the hour
+        self.assertFalse(self.w.core_sync_due(h, ["15m"], now=at(26)))    # other quarters: core stays asleep
+        self.assertTrue(self.w.core_sync_due(h, ["1h"], now=at(41)))      # 1h rows always sync
+        self.assertTrue(self.w.core_sync_due(h, ["15m"], force=True, now=at(41)))
+        h.execute.return_value.fetchone.return_value = (3,)               # rows left unsynced too long
+        self.assertTrue(self.w.core_sync_due(h, ["15m"], now=at(41)))
+    def test_flush_live_skips_core_off_hour(self):
+        h = mock.MagicMock(); h.execute.return_value.fetchone.return_value = (101,)
+        with mock.patch.object(self.w, "hot_db", return_value=h), mock.patch.object(self.w, "db") as core, \
+             mock.patch.object(self.w, "core_sync_due", return_value=False):
+            saved, errs = self.w.flush_live([{"symbol": "BTC-USD", "timeframe": "15m", "as_of": "2026-11-02T19:00:00Z", "model": "Kronos-small"}])
+        core.assert_not_called(); self.assertEqual(errs, []); self.assertEqual(saved[0][1], 101)

@@ -128,13 +128,13 @@ def generate(inp, tries=2):
     return None, last, int((time.time() - t0) * 1000)
 
 def wait_for_write_slot():
-    """Hold the write until the next forecast flush slot (minute % 15 == WRITE_SLOT_MIN, default 11) so it lands
-    inside a window the core DB is already awake for, instead of opening a new 5-minute wake. Capped at 15 min."""
+    """Hold the write until the hourly core window (minute of the hour == WRITE_SLOT_MIN, default 11; the hourly
+    forecast core sync lands then) so it doesn't open a separate 5-minute wake. Capped at 60 min."""
     slot = int(os.environ.get("WRITE_SLOT_MIN", "11"))
     if slot < 0: return
-    now = time.time(); m = (now // 60) % 15
-    wait = ((slot - m) % 15) * 60 - (now % 60)
-    if 0 < wait <= 900: print(f"waiting {int(wait)}s for the write slot"); time.sleep(wait)
+    now = time.time(); m = (now // 60) % 60
+    wait = ((slot - m) % 60) * 60 - (now % 60)
+    if 0 < wait <= 3600: print(f"waiting {int(wait)}s for the write slot"); time.sleep(wait)
 
 def main():
     url = os.environ.get("DATABASE_URL")

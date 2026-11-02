@@ -1,7 +1,7 @@
 name: forecast-15m
 on:
   schedule:
-    - cron: "1,16,31,46 * * * *"   # every 15 min
+    - cron: "8,23,38,53 * * * *"   # every 15 min; backup to the site dispatch at :07 (flush lands ~:11, inside the :10-:14 window)
   workflow_dispatch: {}
 concurrency:
   group: forecast-15m
@@ -19,6 +19,7 @@ jobs:
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
       SUPABASE_DATABASE_URL: ${{ secrets.SUPABASE_DATABASE_URL }}
+      FORECASTS_LIVE: ${{ vars.FORECASTS_LIVE }}   # "1" = always-on DB first, hourly core sync (repo variable, off by default)
       OUTBOX_DIR: outbox   # used only when SUPABASE_DATABASE_URL is set (split mode)
       SYMBOLS: BTC-USD,ETH-USD,SOL-USD,XRP-USD,BNB-USD,DOGE-USD,ADA-USD,AVAX-USD,LINK-USD,SUI-USD
       LOOKBACK: "360"
@@ -69,6 +70,7 @@ jobs:
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
       SUPABASE_DATABASE_URL: ${{ secrets.SUPABASE_DATABASE_URL }}
+      FORECASTS_LIVE: ${{ vars.FORECASTS_LIVE }}   # "1" = always-on DB first, hourly core sync (repo variable, off by default)
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v5
