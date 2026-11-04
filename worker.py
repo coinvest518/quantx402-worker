@@ -383,6 +383,9 @@ def flush_live(rows, force_core=False, shard0=True):
                 if "1h" in tfs or force_core:
                     try: promote(c, h); mirror_tracked(c, h)
                     except Exception as e: print("promote skipped:", type(e).__name__)
+                try:
+                    import outbox; print("outbox catch-up:", outbox.catch_up(h, c))
+                except Exception as e: errors.append(f"outbox: {type(e).__name__}")
                 if shard0:
                     try: print("outcomes filled:", backfill(c, h))
                     except Exception as e: errors.append(f"backfill: {type(e).__name__}")
