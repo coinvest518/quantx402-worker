@@ -1,0 +1,115 @@
+name: forecast-stocks
+# Kronos forecasts for US stocks/ETFs from stored session bars (stock_bars, loaded by stock-bars.yml at :40).
+# CORE_SYNC=defer: rows go to the always-on DB only; the hourly crypto run copies them to the core DB and scores
+# their outcomes in its usual :10-:14 window, so this workflow never wakes the core DB.
+on:
+  schedule:
+    - cron: "50 14-21 * * 1-5"   # 1h, after stock-bars (:40) during the US session (UTC; covers EST and EDT)
+    - cron: "55 22 * * 1-5"      # after the close + final daily bar (stock-bars 22:30): 1h, 4h, 1d
+  workflow_dispatch:
+    inputs:
+      symbols:
+        description: "Comma list (blank = all configured stocks)"
+        required: false
+        default: ""
+      timeframes:
+        description: "1h, 4h, 1d (comma list; no 15m)"
+        required: false
+        default: "1h"
+      counts:
+        description: "Print row counts after the run (core DB only if it is :10-:14)"
+        type: boolean
+        default: false
+concurrency:
+  group: forecast-stocks
+  cancel-in-progress: false
+permissions:
+  contents: read
+jobs:
+  run:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    timeout-minutes: 25
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      SUPABASE_DATABASE_URL: ${{ secrets.SUPABASE_DATABASE_URL }}
+      FORECASTS_LIVE: ${{ vars.FORECASTS_LIVE }}
+      CORE_SYNC: defer
+      OUTBOX_DIR: outbox
+      SYMBOLS: ${{ inputs.symbols || 'SPY,QQQ,AAPL,NVDA,TSLA,MSFT,AMZN,META,GOOGL,IWM,DIA' }}
+      LOOKBACK: "360"
+      PATHS: "30"
+      TEMP: "1.0"
+      TOP_P: "0.9"
+      TORCH_NUM_THREADS: "4"
+      SHARD: ${{ matrix.shard }}
+      SHARDS: "4"
+      HF_HOME: ${{ github.workspace }}/.hf
+      TIMEFRAMES: ${{ inputs.timeframes || (github.event.schedule == '55 22 * * 1-5' && '1h,4h,1d' || '1h') }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Guard timeframes (no 15m until 15m stock bars are stored)
+        run: case ",$TIMEFRAMES," in *,15m,*) echo "15m not supported for stocks"; exit 1;; esac
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install (CPU torch)
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch==2.5.1
+          pip install -r requirements.txt
+      - name: Cache model weights
+        uses: actions/cache@v6
+        with:
+          path: .hf
+          key: hf-kronos-small-v1
+      - name: Warm weights
+        run: python -c "from model import Kronos, KronosTokenizer; KronosTokenizer.from_pretrained('NeoQuasar/Kronos-Tokenizer-base'); Kronos.from_pretrained('NeoQuasar/Kronos-small')"
+      - name: Forecast stocks (always-on DB only)
+        env:
+          HF_HUB_OFFLINE: "1"
+        run: python worker.py
+      - name: Upload outbox
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: outbox-${{ strategy.job-index }}
+          path: outbox/
+          if-no-files-found: ignore
+          retention-days: 1
+  flush:
+    needs: run
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      SUPABASE_DATABASE_URL: ${{ secrets.SUPABASE_DATABASE_URL }}
+      FORECASTS_LIVE: ${{ vars.FORECASTS_LIVE }}
+      CORE_SYNC: defer
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: outbox-*
+          path: outbox
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install (CPU torch)
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch==2.5.1
+          pip install -r requirements.txt
+      - name: Write all shards to the always-on DB (core sync deferred to the hourly run)
+        run: python worker.py flush outbox
+      - name: Row counts
+        if: always() && inputs.counts
+        env:
+          CORE: "1"
+        run: python scripts/stock_counts.py

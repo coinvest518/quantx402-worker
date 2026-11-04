@@ -8,7 +8,7 @@ TIMEFRAMES (default "1h") picks which timeframes to run; "auto" runs every timef
 On-demand jobs: ondemand.py (ondemand.yml, dispatched by the site with a job_id). News: news.py (news.yml, every 20 min).
 Env: DATABASE_URL (Neon direct URL), SYMBOLS, TIMEFRAMES, AUTO_PROMOTE_MAX, LOOKBACK, HORIZON, HORIZON_15M, HORIZON_4H, HORIZON_1D, PATHS, TEMP, TOP_P, TORCH_NUM_THREADS, DRY_RUN=1.
 Timestamps (as_of, horizon_end, times_utc) are candle OPEN times in UTC, matching how Kronos stamps bars."""
-import json, math, os, sys, time, traceback
+import json, math, os, re, sys, time, traceback
 from datetime import datetime, timezone, timedelta
 import numpy as np, pandas as pd, requests, torch
 _ARGV = list(sys.argv)   # 'worker.py flush <dir>' is read from here (argv is cleared below)
@@ -31,6 +31,9 @@ DRY = E("DRY_RUN") == "1" or not DB
 # and are copied to the core DB in one hourly burst, so the core DB wakes once an hour instead of every 15 minutes.
 LIVE = E("FORECASTS_LIVE") == "1" and bool(HOT_DB)
 CORE_SYNC_MAX_AGE_MIN = int(E("CORE_SYNC_MAX_AGE_MIN", "50"))
+# CORE_SYNC=defer (stock workflow): never open the core DB from this run. Rows stay unsynced in the always-on DB and the
+# hourly crypto run copies them (and scores their outcomes) inside its usual core window, so this run adds no core wake.
+DEFER_CORE = E("CORE_SYNC") == "defer"
 STRIKE_STEP = {"BTC": 500, "ETH": 25, "SOL": 1}
 DISCLAIMER = "Probabilistic model output for research and education. Not financial advice. Past results do not guarantee future results."
 iso = lambda t: pd.Timestamp(t).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -232,7 +235,7 @@ def scheduled_symbols(c):
     try:
         auto = [r[0] for r in c.execute("select symbol from tracked_symbols where active and asset_class = 'crypto' and origin = 'auto' order by promoted_at limit %s", (AUTO_MAX,)).fetchall()]
     except Exception: auto = []
-    return SYMBOLS + [s for s in auto if s not in SYMBOLS and re.match(CRYPTO_RE, s)]
+    return SYMBOLS + [s for s in auto if s not in SYMBOLS and (re.match(CRYPTO_RE, s) or re.match(STOCK_RE, s))]
 
 # ---------- db ----------
 def db():
@@ -301,7 +304,7 @@ def scheduled_symbols_hot(h):
     try:
         auto = [r[0] for r in h.execute("select symbol from tracked_symbols_mirror order by promoted_at limit %s", (AUTO_MAX,)).fetchall()]
     except Exception: auto = []
-    return SYMBOLS + [s for s in auto if s not in SYMBOLS and re.match(CRYPTO_RE, s)]
+    return SYMBOLS + [s for s in auto if s not in SYMBOLS and (re.match(CRYPTO_RE, s) or re.match(STOCK_RE, s))]
 
 MARKS_DDL = ("create table if not exists forecast_marks (symbol text not null, timeframe text not null, model text not null, as_of timestamptz not null,"
              " forecast_id bigint, written_at timestamptz not null default now(), primary key (symbol, timeframe, model, as_of))")
@@ -338,6 +341,7 @@ def save_live(h, row):
 
 def core_sync_due(h, tfs, force=False, now=None):
     """Hourly: the run that carries 1h rows, the first quarter of the hour, or anything left unsynced too long."""
+    if DEFER_CORE: return False
     now = now or datetime.now(timezone.utc)
     if force or "1h" in tfs or now.minute < 15: return True
     r = h.execute("select count(*) from forecasts where not synced and created_at < now() - make_interval(mins => %s)", (CORE_SYNC_MAX_AGE_MIN,)).fetchone()
@@ -404,6 +408,9 @@ def flush(paths):
         try: probe = hot_db(); ok = live_ready(probe); probe.close()
         except Exception: ok = False
         if ok: return 1 if flush_live(rows)[1] else 0
+        if DEFER_CORE:
+            print("ERROR: CORE_SYNC=defer and the always-on forecasts table is not ready; not waking the core DB", file=sys.stderr)
+            return 1
         print("WARNING: live mode set but always-on forecasts table not ready; writing to the core DB", file=sys.stderr)
     tfs = sorted({r["timeframe"] for r in rows})
     h = None
@@ -440,6 +447,8 @@ def main():
     if len(argv) > 2 and argv[1] == "flush":
         import glob
         return flush(sorted(glob.glob(os.path.join(argv[2], "**", "*.jsonl"), recursive=True)))
+    if DEFER_CORE and not DRY and not LIVE:
+        raise SystemExit("CORE_SYNC=defer needs FORECASTS_LIVE=1 and SUPABASE_DATABASE_URL (rows must land in the always-on DB)")
     hf = "NeoQuasar/"
     tok = KronosTokenizer.from_pretrained(hf + "Kronos-Tokenizer-base"); mdl = Kronos.from_pretrained(hf + "Kronos-small")
     pred = KronosPredictor(mdl, tok, device="cpu", max_context=512)
@@ -450,6 +459,7 @@ def main():
     if not DRY:
         try: h = hot_db(c); hot_ok = True
         except Exception as e:
+            if DEFER_CORE: raise SystemExit(f"always-on DB unreachable ({type(e).__name__}); CORE_SYNC=defer, not falling back to the core DB")
             # Always-on DB outage must not stop forecasting: fall back to the configured symbols and the core DB, skip the run log.
             print(f"WARNING: always-on DB unreachable ({type(e).__name__}); using configured symbols + core DB, run log skipped", file=sys.stderr)
             split = False
